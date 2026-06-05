@@ -49,7 +49,19 @@ export type ServerMessage =
   | SubtitleMessage
   | StatusMessage
   | PongMessage
-  | EchoMessage;
+  | EchoMessage
+  | CorrectionMessage;
+
+// ─── 修正消息 ───────────────────────────────────────
+
+export interface CorrectionMessage {
+  type: 'correction';
+  segment_id: string;
+  old_text: string;
+  new_text: string;
+  reason: string;
+  confidence: number;
+}
 
 // ─── 前端内部字幕条目 ───────────────────────────────
 

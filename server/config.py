@@ -24,6 +24,11 @@ class Settings:
     DEEPSEEK_TEMPERATURE: float = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.3"))
     DEEPSEEK_MAX_TOKENS: int = int(os.getenv("DEEPSEEK_MAX_TOKENS", "512"))
 
+    # Embedding 服务 (修正引擎)
+    EMBEDDING_MODEL: str = os.getenv(
+        "EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+    )
+
     # DeepSeek (Slice 3 用)
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
     DEEPSEEK_BASE_URL: str = os.getenv(

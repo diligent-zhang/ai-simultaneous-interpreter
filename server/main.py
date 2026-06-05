@@ -25,6 +25,7 @@ from asr.filter import InterimFilter
 from asr.deepgram_provider import DeepgramProvider
 from translator.types import TranslationConfig, TranslationContext
 from translator.deepseek_provider import DeepSeekProvider
+from correction.engine import CorrectionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,8 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     segment_counter = 0
+    # 修正引擎 Sidecar
+    correction_engine = CorrectionEngine() if settings.CORRECTION_ENABLED else None
     asr_active = bool(settings.DEEPGRAM_API_KEY)
     translation_active = bool(settings.DEEPSEEK_API_KEY)
 
@@ -166,6 +169,25 @@ async def websocket_endpoint(ws: WebSocket):
                         context.recent_sentences.append(trans_result.text)
                         if len(context.recent_sentences) > 3:
                             context.recent_sentences.pop(0)
+
+                        # Sidecar: 修正引擎
+                        if correction_engine:
+                            try:
+                                seg_id = f"seg_{segment_counter:04d}"
+                                corr_events = correction_engine.process_translation(
+                                    seg_id, text, trans_result.text
+                                )
+                                for event in corr_events:
+                                    await ws.send_json({
+                                        "type": "correction",
+                                        "segment_id": event.segment_id,
+                                        "old_text": event.old_text,
+                                        "new_text": event.new_text,
+                                        "reason": event.reason.value,
+                                        "confidence": event.confidence,
+                                    })
+                            except Exception as e:
+                                logger.error("Correction engine error: %s", e)
 
                 except Exception as e:
                     logger.error("Translation error for text '%s': %s", text[:30], e)
