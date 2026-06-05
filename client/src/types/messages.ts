@@ -50,3 +50,13 @@ export type ServerMessage =
   | StatusMessage
   | PongMessage
   | EchoMessage;
+
+// ─── 前端内部字幕条目 ───────────────────────────────
+
+export interface SubtitleEntry {
+  id: string;
+  text: string;
+  timestamp: number;
+  source: 'asr' | 'translation';
+  isFinal: boolean;
+}
