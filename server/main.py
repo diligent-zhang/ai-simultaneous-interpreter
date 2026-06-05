@@ -81,6 +81,9 @@ async def websocket_endpoint(ws: WebSocket):
 
         if not asr_active:
             logger.warning("DEEPGRAM_API_KEY not set, falling back to echo")
+            await ws.send_json(StatusMessage(
+                asr_status="idle", translation_status="idle", latency_ms=0,
+            ).model_dump())
             while True:
                 chunk = await audio_queue.get()
                 if chunk is None:
@@ -128,6 +131,9 @@ async def websocket_endpoint(ws: WebSocket):
     async def run_translation():
         if not translation_active:
             logger.warning("DEEPSEEK_API_KEY not set, translation disabled")
+            await ws.send_json(StatusMessage(
+                asr_status="connected", translation_status="idle", latency_ms=0,
+            ).model_dump())
             return
 
         try:
