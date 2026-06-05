@@ -116,7 +116,12 @@ export function useAudioCapture({
       };
 
       source.connect(processor);
-      processor.connect(audioContext.destination); // 连接到输出，否则不触发 onaudioprocess
+
+      // 零增益节点：保持音频图连通（否则 onaudioprocess 不触发），但静音原声
+      const silenceGain = audioContext.createGain();
+      silenceGain.gain.value = 0;
+      processor.connect(silenceGain);
+      silenceGain.connect(audioContext.destination);
 
       setIsCapturing(true);
     } catch (err) {

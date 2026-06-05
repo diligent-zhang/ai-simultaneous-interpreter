@@ -16,6 +16,10 @@ interface AudioCaptureProps {
   isCapturing: boolean;
   setIsCapturing: (capturing: boolean) => void;
   onMessage: (text: string) => void;
+  asrProvider: string;
+  transProvider: string;
+  latencyMs: number;
+  onSettingsClick: () => void;
 }
 
 export default function AudioCapture({
@@ -24,6 +28,10 @@ export default function AudioCapture({
   isCapturing,
   setIsCapturing,
   onMessage,
+  asrProvider,
+  transProvider,
+  latencyMs,
+  onSettingsClick,
 }: AudioCaptureProps) {
   // ─── 处理服务端回显消息 ───────────────────────
   const handleServerMessage = useCallback(
@@ -104,7 +112,10 @@ export default function AudioCapture({
         background: statusColor,
         display: 'inline-block',
       }} />
-      <span>{wsStatus}</span>
+      <span style={{ fontSize: 12 }}>
+        {asrProvider} · {transProvider}
+        {latencyMs > 0 && ` · ${latencyMs}ms`}
+      </span>
       {error && <span style={{ color: '#f44336', marginLeft: 8 }}>{error}</span>}
       {!isCapturing ? (
         <button
@@ -137,6 +148,16 @@ export default function AudioCapture({
           停止
         </button>
       )}
+      <button
+        onClick={onSettingsClick}
+        title="设置"
+        style={{
+          padding: '4px 8px', borderRadius: 4, border: '1px solid #666',
+          background: 'transparent', color: '#fff', cursor: 'pointer', fontSize: 14,
+        }}
+      >
+        ⚙️
+      </button>
     </div>
   );
 }
