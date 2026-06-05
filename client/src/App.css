@@ -10,3 +10,11 @@
 .app > * {
   pointer-events: auto; /* 子组件恢复可交互 */
 }
+
+.app.cinema-mode {
+  background: transparent !important;
+}
+
+.app.cinema-mode .subtitle-entry {
+  background: transparent !important;
+}

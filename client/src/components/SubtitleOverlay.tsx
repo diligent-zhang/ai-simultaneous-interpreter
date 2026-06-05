@@ -3,9 +3,12 @@ import type { SubtitleEntry } from '../types/messages';
 
 interface SubtitleOverlayProps {
   subtitles: SubtitleEntry[];
+  cinemaMode: boolean;
+  fontSize: number;
+  maxLines: number;
 }
 
-export default function SubtitleOverlay({ subtitles }: SubtitleOverlayProps) {
+export default function SubtitleOverlay({ subtitles, cinemaMode, fontSize, maxLines }: SubtitleOverlayProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -33,16 +36,18 @@ export default function SubtitleOverlay({ subtitles }: SubtitleOverlayProps) {
       display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
       pointerEvents: 'none',
     }}>
-      {subtitles.slice(-8).map((entry) => (
+      {subtitles.slice(-maxLines).map((entry) => (
         <div key={entry.id} style={{
-          background: 'rgba(0,0,0,0.75)', borderRadius: 8,
-          padding: entry.source === 'translation' ? '10px 20px' : '4px 20px',
-          animation: 'fadeIn 0.3s ease-out',
+          background: cinemaMode ? 'transparent' : 'rgba(0,0,0,0.75)',
+          borderRadius: 8,
+          padding: entry.source === 'translation' && !cinemaMode ? '10px 20px' : cinemaMode ? '4px 20px' : '4px 20px',
+          animation: cinemaMode ? 'none' : 'fadeIn 0.3s ease-out',
           maxWidth: '100%', textAlign: 'center',
         }}>
           {entry.source === 'asr' ? (
             <div style={{
-              color: 'rgba(255,255,255,0.6)', fontSize: 14, lineHeight: 1.4,
+              color: 'rgba(255,255,255,0.6)', fontSize: Math.round(fontSize * 0.64),
+              lineHeight: 1.4,
               fontStyle: entry.isFinal ? 'normal' : 'italic',
               opacity: entry.isFinal ? 0.8 : 0.5,
             }}>
@@ -50,8 +55,11 @@ export default function SubtitleOverlay({ subtitles }: SubtitleOverlayProps) {
             </div>
           ) : (
             <div style={{
-              color: '#fff', fontSize: 22, fontWeight: 600, lineHeight: 1.5,
+              color: '#fff', fontSize, fontWeight: 600, lineHeight: 1.5,
               wordBreak: 'break-word',
+              ...(cinemaMode
+                ? { textShadow: '0 1px 4px rgba(0,0,0,0.8)' }
+                : {}),
             }}>
               {entry.text}
             </div>
