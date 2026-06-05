@@ -1,7 +1,7 @@
 """AI 同声传译助手 — 后端入口。
 
-Slice 2: Deepgram 流式 ASR 集成。
-接收音频帧 → Deepgram 识别 → 推送字幕消息。
+Slice 3: DeepSeek 流式翻译集成。
+接收音频帧 → Deepgram ASR → InterimFilter → DeepSeek 翻译 → 双语字幕。
 """
 
 import asyncio
@@ -20,14 +20,17 @@ from models.messages import (
     StatusMessage,
     SubtitleMessage,
 )
-from asr.types import ASRConfig, ASRResult
+from asr.types import ASRConfig
+from asr.filter import InterimFilter
 from asr.deepgram_provider import DeepgramProvider
+from translator.types import TranslationConfig, TranslationContext
+from translator.deepseek_provider import DeepSeekProvider
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Simultaneous Interpreter",
-    version="0.2.0",
+    version="0.3.0",
     description="AI 同声传译助手后端服务",
 )
 
@@ -42,100 +45,149 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """健康检查端点。"""
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """主 WebSocket 端点。
-
-    接收 PCM 音频帧 → Deepgram 流式识别 → 推送 SubtitleMessage。
-    支持 JSON 控制消息 (config, ping)。
-    """
     await ws.accept()
     logger.info("Client connected")
 
-    # 每个客户端独立的音频队列和 ASR 状态
     audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    translation_queue: asyncio.Queue[tuple[str, bool] | None] = asyncio.Queue()
     asr_task: asyncio.Task | None = None
+    translation_task: asyncio.Task | None = None
+
     asr_config = ASRConfig(
         language=settings.DEEPGRAM_LANGUAGE,
         model=settings.DEEPGRAM_MODEL,
         sample_rate=settings.DEEPGRAM_SAMPLE_RATE,
     )
+    trans_config = TranslationConfig(
+        model=settings.DEEPSEEK_MODEL,
+        temperature=settings.DEEPSEEK_TEMPERATURE,
+        max_tokens=settings.DEEPSEEK_MAX_TOKENS,
+    )
+
     segment_counter = 0
+    asr_active = bool(settings.DEEPGRAM_API_KEY)
+    translation_active = bool(settings.DEEPSEEK_API_KEY)
 
     async def run_asr():
-        """ASR 协程：消费音频帧 → Deepgram → 推送字幕。"""
         nonlocal segment_counter
 
-        if not settings.DEEPGRAM_API_KEY:
-            logger.warning("DEEPGRAM_API_KEY not set, falling back to echo mode")
-            # 降级：无 API Key 时回显
+        if not asr_active:
+            logger.warning("DEEPGRAM_API_KEY not set, falling back to echo")
             while True:
                 chunk = await audio_queue.get()
                 if chunk is None:
                     break
-                echo_msg = SubtitleMessage(
+                msg = SubtitleMessage(
                     segment_id=f"echo_{segment_counter}",
-                    text=f"[Echo] {len(chunk)} bytes audio frame",
-                    is_final=False,
-                    source="asr",
-                    timestamp=time.time(),
+                    text=f"[Echo] {len(chunk)} bytes",
+                    is_final=False, source="asr", timestamp=time.time(),
                 )
                 segment_counter += 1
-                await ws.send_json(echo_msg.model_dump())
+                await ws.send_json(msg.model_dump())
             return
 
         try:
             provider = DeepgramProvider(api_key=settings.DEEPGRAM_API_KEY)
+            interim_filter = InterimFilter()
+
             async for result in provider.stream_transcribe(audio_queue, asr_config):
                 segment_counter += 1
-                segment_id = f"seg_{segment_counter:04d}"
+                seg_id = f"seg_{segment_counter:04d}"
 
-                subtitle = SubtitleMessage(
-                    segment_id=segment_id,
+                # 1. Push ASR English text to frontend
+                asr_msg = SubtitleMessage(
+                    segment_id=seg_id,
                     text=result.text,
                     is_final=result.is_final,
                     source="asr",
                     confidence=result.confidence,
                     timestamp=time.time(),
                 )
-                await ws.send_json(subtitle.model_dump())
-                logger.debug(
-                    "Subtitle sent: id=%s final=%s text=%s",
-                    segment_id, result.is_final, result.text[:50],
-                )
+                await ws.send_json(asr_msg.model_dump())
+
+                # 2. Filter → enqueue for translation
+                if translation_active and interim_filter.should_send_to_translation(
+                    result.text, result.is_final
+                ):
+                    translation_queue.put_nowait((result.text, result.is_final))
+
         except Exception as e:
             logger.exception("ASR pipeline error: %s", e)
-            status = StatusMessage(
-                asr_status="error",
-                translation_status="idle",
-                latency_ms=0,
+            await ws.send_json(StatusMessage(
+                asr_status="error", translation_status="idle", latency_ms=0,
+            ).model_dump())
+
+    async def run_translation():
+        if not translation_active:
+            logger.warning("DEEPSEEK_API_KEY not set, translation disabled")
+            return
+
+        try:
+            provider = DeepSeekProvider(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url=settings.DEEPSEEK_BASE_URL,
             )
-            await ws.send_json(status.model_dump())
+            context = TranslationContext()
+
+            while True:
+                item = await translation_queue.get()
+                if item is None:
+                    break
+
+                text, is_final = item
+                try:
+                    last_sent = ""
+                    async for trans_result in provider.stream_translate(
+                        text, context, trans_config
+                    ):
+                        if trans_result.finish_reason == "wait":
+                            break
+                        if trans_result.text == last_sent and trans_result.is_partial:
+                            continue
+                        last_sent = trans_result.text
+
+                        if trans_result.text:
+                            trans_msg = SubtitleMessage(
+                                segment_id=f"trans_{segment_counter:04d}",
+                                text=trans_result.text,
+                                is_final=not trans_result.is_partial,
+                                source="translation",
+                                confidence=0.9,
+                                timestamp=time.time(),
+                            )
+                            await ws.send_json(trans_msg.model_dump())
+
+                    if trans_result.text and trans_result.finish_reason == "stop":
+                        context.recent_sentences.append(trans_result.text)
+                        if len(context.recent_sentences) > 3:
+                            context.recent_sentences.pop(0)
+
+                except Exception as e:
+                    logger.error("Translation error for text '%s': %s", text[:30], e)
+        except Exception as e:
+            logger.exception("Translation pipeline error: %s", e)
 
     try:
-        # 发送就绪状态
-        ready_status = StatusMessage(
-            asr_status="connected" if settings.DEEPGRAM_API_KEY else "idle",
-            translation_status="idle",
+        await ws.send_json(StatusMessage(
+            asr_status="connected" if asr_active else "idle",
+            translation_status="connected" if translation_active else "idle",
             latency_ms=0,
-        )
-        await ws.send_json(ready_status.model_dump())
+        ).model_dump())
 
-        # 启动 ASR 协程
         asr_task = asyncio.create_task(run_asr())
+        if translation_active:
+            translation_task = asyncio.create_task(run_translation())
 
-        # 主循环：接收消息
         while True:
             data = await ws.receive()
 
             if "bytes" in data:
-                # 音频帧 → 入队
-                audio_bytes = data["bytes"]
-                audio_queue.put_nowait(audio_bytes)
+                audio_queue.put_nowait(data["bytes"])
 
             elif "text" in data:
                 msg = json.loads(data["text"])
@@ -143,43 +195,35 @@ async def websocket_endpoint(ws: WebSocket):
 
                 if msg_type == "ping":
                     PingMessage.model_validate(msg)
-                    pong = PongMessage()
-                    await ws.send_json(pong.model_dump())
-
+                    await ws.send_json(PongMessage().model_dump())
                 elif msg_type == "config":
                     ConfigMessage.model_validate(msg)
                     logger.info("Config received: %s", msg)
-                    status = StatusMessage()
-                    await ws.send_json(status.model_dump())
+                    await ws.send_json(StatusMessage().model_dump())
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
     except (json.JSONDecodeError, ValueError) as e:
-        logger.error("Invalid message received: %s", e)
+        logger.error("Invalid message: %s", e)
         await ws.close(code=1003, reason="Invalid message format")
     except Exception:
-        logger.exception("Unexpected error in WebSocket handler")
+        logger.exception("Unexpected error")
         await ws.close(code=1011, reason="Internal server error")
     finally:
-        # 清理：发送 None 停止音频转发，取消 ASR 任务
         audio_queue.put_nowait(None)
-        if asr_task:
-            asr_task.cancel()
-            try:
-                await asr_task
-            except asyncio.CancelledError:
-                pass
+        translation_queue.put_nowait(None)
+        for task in [asr_task, translation_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 def main():
-    """启动服务。"""
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=True,
-    )
+    uvicorn.run("main:app", host=settings.HOST, port=settings.PORT, reload=True)
 
 
 if __name__ == "__main__":

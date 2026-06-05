@@ -8,7 +8,7 @@
 import { useCallback, useEffect } from 'react';
 import { useAudioCapture } from '../hooks/useAudioCapture';
 import { connect, disconnect, sendAudioFrame, sendMessage, onMessage, onStatus } from '../services/websocket';
-import type { EchoMessage, ServerMessage } from '../types/messages';
+import type { EchoMessage, SubtitleMessage, ServerMessage } from '../types/messages';
 
 interface AudioCaptureProps {
   wsStatus: string;
@@ -31,6 +31,8 @@ export default function AudioCapture({
       if (msg.type === 'echo') {
         const echo = msg as EchoMessage;
         onMessage(`📡 ${echo.message}`);
+      } else if (msg.type === 'subtitle') {
+        // Subtitles are handled in App.tsx via onMessage
       }
     },
     [onMessage]
