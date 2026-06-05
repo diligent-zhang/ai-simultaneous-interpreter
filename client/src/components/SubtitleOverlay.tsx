@@ -63,6 +63,10 @@ export default function SubtitleOverlay({ subtitles }: SubtitleOverlayProps) {
           from { opacity: 0; transform: translateY(10px); }
           to { opacity: 1; transform: translateY(0); }
         }
+        @keyframes correctionFlash {
+          0% { background: rgba(255, 200, 0, 0.5); }
+          100% { background: rgba(0, 0, 0, 0.75); }
+        }
       `}</style>
     </div>
   );
