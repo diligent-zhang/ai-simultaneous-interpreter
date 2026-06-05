@@ -5,11 +5,21 @@ Slice 1: 基础 WebSocket 连通性验证。
 """
 
 import json
+import logging
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from models.messages import EchoMessage, PongMessage
+from models.messages import (
+    ConfigMessage,
+    EchoMessage,
+    PingMessage,
+    PongMessage,
+    StatusMessage,
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Simultaneous Interpreter",
@@ -20,7 +30,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -41,7 +51,7 @@ async def websocket_endpoint(ws: WebSocket):
     - JSON 控制消息 (config, ping)
     """
     await ws.accept()
-    print(f"[WS] Client connected")
+    logger.info("Client connected")
 
     try:
         while True:
@@ -56,6 +66,7 @@ async def websocket_endpoint(ws: WebSocket):
                     message=f"audio frame received: {len(audio_bytes)} bytes",
                 )
                 await ws.send_json(echo.model_dump())
+                logger.debug("Audio frame received: %d bytes", len(audio_bytes))
 
             elif "text" in data:
                 # JSON 控制消息
@@ -63,25 +74,25 @@ async def websocket_endpoint(ws: WebSocket):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "ping":
+                    PingMessage.model_validate(msg)
                     pong = PongMessage()
                     await ws.send_json(pong.model_dump())
 
                 elif msg_type == "config":
+                    ConfigMessage.model_validate(msg)
                     # Slice 1 仅打印配置，后续切片使用
-                    print(f"[WS] Config received: {msg}")
-                    status = {
-                        "type": "status",
-                        "asr_status": "idle",
-                        "translation_status": "idle",
-                        "latency_ms": 0,
-                    }
-                    await ws.send_json(status)
+                    logger.info("Config received: %s", msg)
+                    status = StatusMessage()
+                    await ws.send_json(status.model_dump())
 
     except WebSocketDisconnect:
-        print(f"[WS] Client disconnected")
-    except Exception as e:
-        print(f"[WS] Error: {e}")
-        await ws.close(code=1011, reason=str(e))
+        logger.info("Client disconnected")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error("Invalid message received: %s", e)
+        await ws.close(code=1003, reason="Invalid message format")
+    except Exception:
+        logger.exception("Unexpected error in WebSocket handler")
+        await ws.close(code=1011, reason="Internal server error")
 
 
 def main():
