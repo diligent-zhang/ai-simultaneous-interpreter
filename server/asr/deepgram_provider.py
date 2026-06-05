@@ -1,7 +1,7 @@
 """Deepgram 流式 ASR 实现。
 
-使用 deepgram-sdk 的 listen_websocket() 方法，
-通过 asyncio.Queue 桥接音频帧。
+使用 deepgram-sdk v3 的 listen.websocket() 方法，
+通过 asyncio.Queue 桥接音频帧与 AsyncIterator[ASRResult]。
 """
 
 import asyncio
@@ -17,26 +17,81 @@ logger = logging.getLogger(__name__)
 
 
 class DeepgramProvider(ASRProvider):
-    """Deepgram 流式语音识别提供者。"""
+    """Deepgram 流式语音识别提供者。
+
+    每个客户端会话创建一个实例，
+    通过 WebSocket 推送音频帧到 Deepgram Live API，
+    异步产出 ASRResult。
+    """
 
     def __init__(self, api_key: str):
         self._api_key = api_key
-        self._connection: DeepgramClient | None = None
+        self._dg_ws = None  # ListenWebSocketClient
 
     async def stream_transcribe(
         self,
         audio_queue: asyncio.Queue[bytes | None],
         config: ASRConfig,
     ) -> AsyncIterator[ASRResult]:
-        """建立 Deepgram WebSocket，消费音频帧，产出结果。"""
-        # 创建结果队列（桥接 Deepgram 回调 → AsyncIterator）
+        """建立 Deepgram WebSocket，消费音频帧，流式产出结果。"""
+
         result_queue: asyncio.Queue[ASRResult | None] = asyncio.Queue()
+        open_event = asyncio.Event()
 
-        # 初始化 Deepgram 客户端
+        # ── 初始化 Deepgram 客户端 ──────────────────────────
         deepgram = DeepgramClient(self._api_key)
-        self._connection = deepgram
+        dg_ws = deepgram.listen.websocket()
+        self._dg_ws = dg_ws
 
-        # 配置 LiveOptions
+        # ── 回调定义 (Deepgram SDK v3 的回调签名不含 self) ──
+        def on_open(connection, open_result, **kwargs):
+            logger.info("Deepgram connection opened")
+            open_event.set()
+
+        def on_result(connection, result, **kwargs):
+            """将 Deepgram TranscriptResponse 转为 ASRResult。"""
+            try:
+                channel = result.channel
+                alt = channel.alternatives[0]
+                text = alt.transcript
+
+                if not text or not text.strip():
+                    return
+
+                is_final = result.is_final
+                confidence = alt.confidence if is_final else 0.5
+                duration = result.duration if hasattr(result, "duration") else 0.0
+
+                asr_result = ASRResult(
+                    text=text.strip(),
+                    is_final=is_final,
+                    confidence=confidence,
+                    duration=duration,
+                )
+                result_queue.put_nowait(asr_result)
+
+                logger.debug(
+                    "Deepgram: final=%s conf=%.2f text=%s",
+                    is_final, confidence, text[:60],
+                )
+            except Exception:
+                logger.exception("Error processing Deepgram result")
+
+        def on_error(connection, error, **kwargs):
+            logger.error("Deepgram error: %s", error)
+            result_queue.put_nowait(None)
+
+        def on_close(connection, close_code, **kwargs):
+            logger.info("Deepgram connection closed (code=%s)", close_code)
+            result_queue.put_nowait(None)
+
+        # ── 注册回调 ────────────────────────────────────────
+        dg_ws.on(LiveTranscriptionEvents.Open, on_open)
+        dg_ws.on(LiveTranscriptionEvents.Transcript, on_result)
+        dg_ws.on(LiveTranscriptionEvents.Error, on_error)
+        dg_ws.on(LiveTranscriptionEvents.Close, on_close)
+
+        # ── 配置选项 ────────────────────────────────────────
         options = LiveOptions(
             model=config.model,
             language=config.language,
@@ -48,68 +103,31 @@ class DeepgramProvider(ASRProvider):
             smart_format=config.smart_format,
         )
 
-        # 建立 Deepgram WebSocket 连接
-        dg_ws = deepgram.listen.websocket()
-
-        # ─── Deepgram 回调 → result_queue ───────────────────
-        def on_open(*args, **kwargs):
-            logger.info("Deepgram connection opened")
-
-        def on_result(self_handler, result, **kwargs):
-            """每个识别结果（interim 或 final）"""
-            try:
-                sentence = result.channel.alternatives[0]
-                text = sentence.transcript
-                if not text or not text.strip():
-                    return
-
-                is_final = result.is_final
-                confidence = sentence.confidence if is_final else 0.5
-                duration = result.duration if hasattr(result, 'duration') else 0.0
-
-                asr_result = ASRResult(
-                    text=text.strip(),
-                    is_final=is_final,
-                    confidence=confidence,
-                    duration=duration,
-                )
-                result_queue.put_nowait(asr_result)
-            except Exception as e:
-                logger.error("Error processing Deepgram result: %s", e)
-
-        def on_error(self_handler, error, **kwargs):
-            logger.error("Deepgram error: %s", error)
-            result_queue.put_nowait(None)  # 信号：异常终止
-
-        def on_close(self_handler, **kwargs):
-            logger.info("Deepgram connection closed")
-            result_queue.put_nowait(None)  # 信号：正常结束
-
-        # 注册回调
-        dg_ws.on(LiveTranscriptionEvents.Open, on_open)
-        dg_ws.on(LiveTranscriptionEvents.Transcript, on_result)
-        dg_ws.on(LiveTranscriptionEvents.Error, on_error)
-        dg_ws.on(LiveTranscriptionEvents.Close, on_close)
-
-        # 启动 Deepgram 连接
+        # ── 启动连接 ────────────────────────────────────────
         if not dg_ws.start(options):
             logger.error("Failed to start Deepgram WebSocket")
             return
 
-        # ─── 音频转发协程 ────────────────────────────────
+        # 等待连接就绪 (最多 10 秒)
+        try:
+            await asyncio.wait_for(open_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.error("Deepgram connection timed out")
+            return
+
+        # ── 音频转发协程 ────────────────────────────────────
         async def forward_audio():
-            """从 audio_queue 读取 PCM 帧，发送到 Deepgram。"""
             try:
                 while True:
                     chunk = await audio_queue.get()
                     if chunk is None:
-                        # 流结束信号
                         break
                     dg_ws.send(chunk)
-            except Exception as e:
-                logger.error("Audio forwarding error: %s", e)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Audio forwarding error")
             finally:
-                # 发送关闭信号
                 try:
                     dg_ws.finish()
                 except Exception:
@@ -117,7 +135,7 @@ class DeepgramProvider(ASRProvider):
 
         forward_task = asyncio.create_task(forward_audio())
 
-        # ─── 产出结果 ──────────────────────────────────────
+        # ── 产出结果 ────────────────────────────────────────
         try:
             while True:
                 result = await result_queue.get()
@@ -132,11 +150,10 @@ class DeepgramProvider(ASRProvider):
                 pass
 
     async def close(self) -> None:
-        """释放 Deepgram 连接资源。"""
-        if self._connection:
+        """释放 Deepgram WebSocket 连接。"""
+        if self._dg_ws:
             try:
-                # Deepgram SDK 的连接在 finish() 时自动关闭
-                pass
+                self._dg_ws.finish()
             except Exception:
                 pass
-            self._connection = None
+            self._dg_ws = None
