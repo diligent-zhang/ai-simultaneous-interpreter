@@ -15,6 +15,9 @@ class Settings:
 
     # Deepgram (Slice 2 用)
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+    DEEPGRAM_MODEL: str = os.getenv("DEEPGRAM_MODEL", "nova-3")
+    DEEPGRAM_LANGUAGE: str = os.getenv("DEEPGRAM_LANGUAGE", "en")
+    DEEPGRAM_SAMPLE_RATE: int = int(os.getenv("DEEPGRAM_SAMPLE_RATE", "16000"))
 
     # DeepSeek (Slice 3 用)
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
