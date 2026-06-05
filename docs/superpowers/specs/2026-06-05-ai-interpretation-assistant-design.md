@@ -1,6 +1,6 @@
 # AI 同声传译助手 — 设计文档
 
-> 版本: v1.0 | 日期: 2026-06-05 | 状态: 待实现
+> 版本: v1.1 | 日期: 2026-06-05 | 状态: 待实现
 
 ---
 
@@ -137,15 +137,62 @@ ASR 中间结果:  "Artif..."(0.3s)    "AI is trans..."(1.2s)   "AI is transform
                                                    └─────────────────────┘
 ```
 
-### 4.2 三层递进翻译策略
+### 4.2 客户端预处理过滤
+
+在 ASR 结果发送到 LLM 翻译之前，浏览器端做轻量过滤，减少无效翻译调用。
+
+**过滤规则（<0.1ms）：**
+
+```typescript
+interface InterimFilter {
+  // 规则1: 文本变化 < 3 字符 → 跳过
+  minCharDelta: 3,
+  // 规则2: 距上次发送 < 200ms → 跳过（防止高频抖动）
+  minIntervalMs: 200,
+  // 规则3: 纯标点/语气词 → 跳过
+  excludePattern: /^(um|uh|er|hmm|\.{2,}|\s*)$/i
+}
+
+function shouldSendToTranslation(
+  text: string, 
+  prevText: string, 
+  timeSinceLastSend: number
+): boolean {
+  if (text.length - prevText.length < 3) return false;
+  if (timeSinceLastSend < 200) return false;
+  if (/^(um|uh|er|hmm|\.{3,}|\s*)$/i.test(text)) return false;
+  return true;
+}
+```
+
+**句子完整性预判（浏览器端，<0.5ms）：**
+
+```typescript
+function shouldTranslate(text: string, timeSinceLastFinal: number): boolean {
+  // 1. 以句末标点结束 → 大概率完整，发送
+  if (/[.!?。！？\n]$/.test(text)) return true;
+  // 2. 包含完整的主谓结构 (简单启发式，正则规则)
+  if (hasSubjectPredicatePattern(text)) return true;
+  // 3. 距离上次 final 已超过 3 秒 → 强制发送，避免长时间空白
+  if (timeSinceLastFinal > 3000) return true;
+  // 4. 纯 interim 片段 → 不调用 LLM，节省成本
+  return false;
+}
+```
+
+**效果**：每句话从 20+ 次 LLM 调用降至 3-5 次，成本降低约 75%，延迟不受影响，且 WAIT 判断从 LLM 移到了浏览器端。
+
+### 4.3 三层递进翻译策略
 
 #### 第一层：智能分块（Chunking）
 
 不做逐词翻译，也不等完整句子。在自然语义断点处翻译。
 
-- LLM 判断当前输入是否构成可翻译的完整语义单元
+- 浏览器端先做完整性预判（见 4.2），通过后才发送 LLM
+- LLM 收到后二次判断：当前输入是否构成可翻译的完整语义单元
 - 不完整时返回等待信号，不强行翻译
 - 减少因语序差异导致的回溯修正
+- 浏览器端预判节省了大部分"WAIT"类无效 LLM 调用
 
 #### 第二层：结构感知翻译（Structure-Aware Translation）
 
@@ -165,7 +212,7 @@ ASR 中间结果:  "Artif..."(0.3s)    "AI is trans..."(1.2s)   "AI is transform
 | 语序结构 | 后续内容揭示前文语序需调整 | 携带完整上下文 → LLM 重译（~300ms） |
 | 指代消解 | 代词指向前文未明确的概念 | LLM 判断指代 → 替换为具体名词（~200ms） |
 
-### 4.3 修正消息协议
+### 4.4 修正消息协议
 
 ```json
 // 翻译修正
@@ -189,11 +236,46 @@ ASR 中间结果:  "Artif..."(0.3s)    "AI is trans..."(1.2s)   "AI is transform
 }
 ```
 
-### 4.4 修正静默窗口
+### 4.5 修正静默窗口与置信度门控
 
+**修正静默窗口：**
 - final 后 2 秒内：允许静默修正（用户不易察觉）
 - final 后超过 2 秒：修正时前端不做动画（影院模式）/ 做轻动画（悬浮窗模式）
 - 同一 segment 最多修正 2 次，避免反复闪烁
+
+**修正置信度门控（避免过度修正）：**
+
+并非所有翻译差异都需要修正。"改变"和"重塑"语义接近，强行统一的修正反而是退步。
+
+```python
+def should_correct(old: str, new: str, context: str) -> tuple[bool, float]:
+    """
+    通过语义差异阈值 + LLM 确认，决定是否触发修正。
+    返回 (是否修正, 置信度)
+    """
+    # 1. 计算语义差异 (embedding cosine distance)
+    old_emb = embed(old)
+    new_emb = embed(new)
+    similarity = cosine_similarity(old_emb, new_emb)
+    diff = 1 - similarity
+    
+    # 2. 语义差异 < 0.3 → 近义词替换，不修正，避免闪烁
+    if diff < 0.3:
+        return False, 1.0 - diff
+    
+    # 3. 差异 0.3-0.5 → 边界情况，调用 LLM 裁决
+    if diff < 0.5:
+        judgment = llm.judge_correction_necessity(old, new, context)
+        return judgment.is_needed, judgment.confidence
+    
+    # 4. 差异 > 0.5 → 明显错误，直接修正
+    return True, diff
+```
+
+**门控效果：**
+- 近义词替换（"改变"↔"重塑"）→ 不修正，diff ≈ 0.2
+- 术语漂移（"模型"↔"模式" for "model"）→ LLM 裁决，diff ≈ 0.4
+- 明显错译（"狗"↔"猫"）→ 直接修正，diff > 0.7
 
 ---
 
@@ -206,6 +288,8 @@ App
 ├── AudioCapture          ← 音频源选择 + 捕获
 │   ├── TabCapture        ← 浏览器标签页捕获 (getDisplayMedia)
 │   └── SystemAudio       ← 系统音频 (后续桌面端)
+│
+├── InterimFilter          ← 客户端预处理 (减少 LLM 调用)
 │
 ├── WebSocketClient       ← 后端通信 (单例)
 │
@@ -247,10 +331,39 @@ App
 
 ### 5.4 TTS 行为
 
+Chrome `SpeechSynthesis` 存在已知 bug：长文本 (>200 字) 的 utterance 会被静默截断。需要智能分块朗读。
+
+**分块策略：**
+
+```typescript
+function speakWithChunking(text: string): void {
+  const MAX_CHUNK = 150; // 字符，安全阈值
+  
+  // 在自然断点处分块 (逗号、分号、从句边界)
+  const chunks = splitAtNaturalBreaks(text, MAX_CHUNK);
+  
+  for (const chunk of chunks) {
+    const utterance = new SpeechSynthesisUtterance(chunk);
+    utterance.lang = 'zh-CN';
+    utterance.rate = 1.1;  // 稍快 10%，匹配同传节奏
+    utterance.volume = ttsVolume;
+    speechQueue.push(utterance);
+  }
+}
+
+function splitAtNaturalBreaks(text: string, maxLen: number): string[] {
+  const breakPoints = /[，；。！？,\n]/g;
+  // 在最近的断点处分割，保证每段 ≤ maxLen
+  // ...
+}
+```
+
+**播放行为：**
 - 浏览器 `SpeechSynthesis API`，音色 `zh-CN`
-- 播放队列：每个 stable 句段入队
-- 追进度机制：队列 >3 句积压 → 跳过中间句，直接播最新
+- 播放队列：每个 stable 句段分块后入队
+- 追进度机制：队列 >3 个句段积压 → 跳过中间句段，直接播最新
 - 被修正句段不重新朗读
+- 用户可独立调节 TTS 音量（与系统音量分离）
 
 ### 5.5 顶部状态栏
 
@@ -290,9 +403,12 @@ server/
 │   ├── detector.py          ← 冲突检测 (术语/指代/语义)
 │   └── types.py             ← 修正事件类型定义
 │
+├── embedding/
+│   └── embedder.py           ← Embedding 服务 (修正置信度门控)
+│
 ├── session/
 │   ├── manager.py           ← 会话管理器
-│   └── context_window.py    ← 滑动上下文窗口
+│   └── context_window.py    ← 层级化上下文窗口
 │
 ├── rag/                     ← Phase 2
 │   ├── store.py             ← 向量数据库 (Chroma)
@@ -346,40 +462,103 @@ class TranslationProvider(ABC):
 └──────────────────────────────────────────────────┘
 ```
 
-### 6.4 修正引擎
+### 6.4 修正引擎与层级化上下文
+
+**层级化上下文窗口：**
+
+FIFO 平权窗口的问题：第 1 句定义的核心术语，到第 11 句就被丢弃了。改用三层结构：
 
 ```
-核心流程:
+┌──────────────────────────────────────────────┐
+│  Layer 1: 关键术语表 (全会话持续)              │
+│  "transformer" → "Transformer 模型"          │
+│  "RLHF" → "基于人类反馈的强化学习"            │
+│  大小: ~500 tokens, 永不逐出                  │
+│  管理: 新术语自动入表，有 LRU 淘汰             │
+├──────────────────────────────────────────────┤
+│  Layer 2: 话题摘要 (最近 5 分钟)               │
+│  LLM 每 ~2 分钟自动生成一次会话摘要            │
+│  大小: ~500 tokens                           │
+│  作用: 提供中距离上下文，消解指代和话题漂移    │
+├──────────────────────────────────────────────┤
+│  Layer 3: 最近原文 verbatim (最近 3 句)        │
+│  大小: ~300 tokens                           │
+│  作用: 提供紧邻上下文，保证语篇连贯            │
+└──────────────────────────────────────────────┘
+总上下文: ~1300 tokens，远低于模型窗口，留足生成空间
+```
+
+**核心流程:**
+
 1. 每个 final 句段进入:
-   a. 追加到滑动窗口 (最近 10 句或 ~2000 tokens，以先达到者为准)
-   b. 提取关键术语 + 指代链
-   c. 与窗口内历史句段做冲突检测
+   a. 原始文本追加到 Layer 3（最近原文）
+   b. 提取关键术语 → Layer 1 去重入表（LRU 淘汰）
+   c. 对三层上下文做冲突检测
 
 2. 冲突检测维度:
-   · 术语一致性: 同一英文词前后译法不同
-   · 指代消解: 代词指向不明确，上下文已澄清
+   · 术语一致性: 同一英文词前后译法不同（Layer 1 术语表辅助判断）
+   · 指代消解: 代词指向不明确，Layer 2 摘要提供中距消歧
    · 语义连贯: 前后句存在因果/转折但翻译未体现
 
 3. 修正策略:
    · 小修正 (术语替换): 本地规则，不调用 LLM (<5ms)
-   · 大修正 (指代/语序): 调用 LLM 重译 (~300ms)
+   · 大修正 (指代/语序): 携带三层上下文调用 LLM 重译 (~300ms)
+   · 置信度门控: semantic diff < 0.3 不修正，0.3-0.5 LLM 裁决，>0.5 直接修正
    · 成本控制: 单次会话最多 20 次 LLM 修正调用
 
-4. 输出:
-   · 修正事件 {type, segment_id, old_text, new_text, reason}
+4. 话题摘要更新:
+   · LLM 每 ~2 分钟生成一次 Layer 2 摘要（异步，不阻塞主线）
+
+5. 输出:
+   · 修正事件 {type, segment_id, old_text, new_text, reason, confidence}
 ```
 
 ### 6.5 延迟预算
 
+**稳态延迟（预热后）：**
+
 | 环节 | 目标延迟 | 说明 |
 |------|---------|------|
 | 浏览器音频采集 | ~20ms | 40ms/帧，采集即发 |
+| 客户端预处理过滤 | ~1ms | Interim 过滤 + 完整性预判 |
 | 网络传输 (上行) | ~50ms | PCM 原始音频 |
-| Deepgram ASR (首 interim) | ~300ms | 流式 API |
-| DeepSeek 翻译 (首 token) | ~500ms | 流式输出 |
+| Deepgram ASR (首 interim) | ~300ms | 流式 API（连接已预热） |
+| DeepSeek 翻译 (首 token) | ~500ms | 流式输出（连接已预热） |
 | 网络传输 (下行) | ~50ms | 单句 JSON <1KB |
-| 前端渲染 + TTS 启动 | ~50ms | 瞬时 |
-| **总计** | **~970ms** | 低于 3s 目标 |
+| 前端渲染 + TTS 启动 | ~50ms | 瞬时（TTS 分块预加载） |
+| **稳态总计** | **~971ms** | 稳定低于 3s 目标 |
+
+**冷启动额外延迟（无预热时首句）：**
+
+| 环节 | 额外延迟 |
+|------|---------|
+| Deepgram WS 连接建立 | ~200ms |
+| DeepSeek API 冷启动 | ~300ms |
+| **冷启动总计** | **~1471ms** |
+
+### 6.6 连接预热
+
+消除首句冷启动延迟——页面加载时即建立所有连接：
+
+```
+用户打开页面 (onMount)
+  │
+  ├── ① 建立后端 WebSocket ──────────────── 并行
+  ├── ② Deepgram: 发起流式连接 + 发送 500ms 静音帧预热
+  └── ③ DeepSeek: 发送一条空翻译预热请求
+       (System: "Warm-up. Reply 'OK'.")
+  
+  ▼ 所有连接就绪 (~500ms)
+  
+状态栏显示 🟢 就绪，等待音频
+  
+用户开始播放音频 → 首字延迟 ~800ms（无冷启动惩罚）
+```
+
+**预热超时处理：**
+- 5 秒内未完成预热 → 显示 🟡 预热中…
+- 预热失败不影响使用 → 首句走冷启动路径，后续自动恢复稳态
+- 用户开始播放音频时预热仍未完成 → 立即中断预热，切换为实时模式
 
 ---
 
@@ -506,10 +685,12 @@ ASR:
 
 ## 十、已知局限
 
-1. **跨句长距离依赖**：超出滑动窗口的上下文无法回溯修正
-2. **文化负载词/隐喻**：需要世界知识，实时场景下可能字面直译
+1. **跨句长距离依赖**：层级化上下文（Layer 2 摘要 + Layer 1 术语表）大幅缓解了此问题，但超出 5 分钟的远距离依赖仍无法回溯修正
+2. **文化负载词/隐喻**：需要世界知识，实时场景下可能字面直译，Phase 2 的 RAG 将部分缓解
 3. **口音/极快语速**：ASR 源头出错 → 下游全错，修正能力有限
-4. **修正闪烁**：同一句修正 >2 次用户会察觉，通过静默窗口控制
+4. **修正闪烁**：置信度门控（semantic diff < 0.3 不修正）+ 静默窗口双层防护，闪烁已最小化
+5. **TTS 音色单一**：浏览器内置 `zh-CN` 音色不如商业 TTS 自然，Phase 2 可切换云端 TTS
+6. **Embedding 服务依赖**：修正置信度门控需要 Embedding 服务（本地模型或 API），如不可用则退化为仅 LLM 裁决模式
 
 ---
 
@@ -517,10 +698,12 @@ ASR:
 
 ### Phase 1 — MVP
 - 基础流式管道（Deepgram + DeepSeek + WebSocket）
+- 客户端预处理过滤（Interim 过滤 + 句子完整性预判）
+- 连接预热（消除冷启动延迟）
 - 字幕渲染（悬浮窗 + 影院双模式）
-- 浏览器 TTS
-- 基础修正引擎（术语一致性）
-- 异常降级
+- 浏览器 TTS（含智能分块朗读）
+- 修正引擎（层级化上下文 + 置信度门控 + 三维修正）
+- 异常降级与自动切换
 
 ### Phase 2 — 增强
 - Function Calling 集成
@@ -549,6 +732,7 @@ ASR:
 - Python 3.11+ / FastAPI
 - Deepgram SDK
 - OpenAI SDK (兼容 DeepSeek API)
+- sentence-transformers (Embedding，修正置信度门控)
 - Chroma (Phase 2)
 
 ### 外部服务
