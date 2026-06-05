@@ -5,3 +5,4 @@ pydantic==2.10.5
 python-dotenv==1.0.1
 deepgram-sdk==3.9.0
 openai>=1.0.0
+sentence-transformers>=3.0.0
