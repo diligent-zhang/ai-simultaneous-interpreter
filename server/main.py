@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
@@ -61,6 +62,27 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "version": "0.4.0"}
+
+
+# ─── TTS API ────────────────────────────────────────────────────
+
+@app.get("/api/tts")
+async def tts_synthesize(
+    text: str = Query(..., min_length=1, max_length=300),
+    voice: str = Query(default="zh-CN-XiaoxiaoNeural"),
+    rate: str = Query(default="+10%"),
+):
+    """流式 TTS 合成端点。返回 audio/mpeg 流。"""
+    try:
+        from tts.edge_provider import stream_synthesize
+    except ImportError:
+        raise HTTPException(status_code=503, detail="TTS service unavailable")
+
+    return StreamingResponse(
+        stream_synthesize(text, voice, rate),
+        media_type="audio/mpeg",
+        headers={"X-TTS-Provider": "edge"},
+    )
 
 
 # ─── Glossary API ───────────────────────────────────────────────
