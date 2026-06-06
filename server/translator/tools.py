@@ -81,12 +81,13 @@ def format_glossary_context(matches: list[dict]) -> str:
     return "参考术语: " + "; ".join(lines)
 
 
-async def enrich_context(text: str, retriever) -> str:
+async def enrich_context(text: str, retriever, session_glossary=None) -> str:
     """从 RAG 检索相关术语，构建术语表注入文本。
 
     Args:
         text: 英文源文本
         retriever: Retriever 实例（来自 rag 模块）
+        session_glossary: ContextWindow 实例（会话即时学习术语）
 
     Returns:
         术语表注入文本，无匹配时返回空字符串
@@ -106,7 +107,18 @@ async def enrich_context(text: str, retriever) -> str:
         except Exception as e:
             logger.warning("RAG search failed: %s", e)
 
-    # 4. Merge and deduplicate
+    # 4. Session glossary search
+    session_matches = []
+    if session_glossary and candidates:
+        try:
+            for candidate in candidates:
+                session_matches.extend(
+                    session_glossary.search_glossary(candidate)
+                )
+        except Exception:
+            pass
+
+    # 5. Merge: RAG > session > acronym (priority order)
     all_matches = []
     seen_en = set()
 
@@ -115,6 +127,12 @@ async def enrich_context(text: str, retriever) -> str:
         if en_lower not in seen_en:
             seen_en.add(en_lower)
             all_matches.append({"en": m["en"], "zh": m["zh"], "source": "rag"})
+
+    for m in session_matches:
+        en_lower = m["en"].lower()
+        if en_lower not in seen_en:
+            seen_en.add(en_lower)
+            all_matches.append(m)  # Already has "source": "session"
 
     for m in acronym_matches:
         en_lower = m["en"].lower()
@@ -126,7 +144,10 @@ async def enrich_context(text: str, retriever) -> str:
         return ""
 
     logger.debug(
-        "Context enriched: %d terms from %d candidates",
-        len(all_matches), len(candidates),
+        "Context enriched: %d terms (rag=%d, session=%d, acronym=%d)",
+        len(all_matches),
+        sum(1 for m in all_matches if m.get("source") == "rag"),
+        sum(1 for m in all_matches if m.get("source") == "session"),
+        sum(1 for m in all_matches if m.get("source") == "acronym"),
     )
     return format_glossary_context(all_matches)

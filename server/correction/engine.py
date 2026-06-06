@@ -34,6 +34,13 @@ class CorrectionEngine:
 
         # 1. 写入上下文窗口
         self.context.add_sentence(original, translation)
+
+        # 1b. 自动提取术语到 session glossary
+        try:
+            self.context.extract_terms(original, translation)
+        except Exception:
+            pass  # 不阻塞翻译主流
+
         self._segment_history[segment_id] = {
             "text": translation,
             "timestamp": time.time(),

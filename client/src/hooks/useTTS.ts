@@ -1,17 +1,28 @@
 /**
- * useTTS — 浏览器 TTS 朗读 Hook。
+ * useTTS — 双路径 TTS 朗读 Hook。
  *
- * 智能分块: 在自然断点处分割，每段 ≤150 字。
- * 追进度: 队列 >3 积压 → 跳过中间，直接播最新。
+ * Browser 模式: SpeechSynthesis API（现有逻辑）
+ * Edge 模式: fetch /api/tts → AudioContext 解码播放
+ *
+ * 两种模式共用智能分块 + 队列追进度机制。
  */
 import { useRef, useCallback } from 'react';
 
 const MAX_CHUNK = 150;
 const MAX_QUEUE = 3;
 
-export function useTTS() {
-  const queueRef = useRef<SpeechSynthesisUtterance[]>([]);
-  const speakingRef = useRef(false);
+interface TTSOptions {
+  provider: 'browser' | 'edge';
+  voice?: string;
+}
+
+export function useTTS(options?: TTSOptions) {
+  const provider = options?.provider ?? 'browser';
+  const voice = options?.voice ?? 'zh-CN-XiaoxiaoNeural';
+
+  const queueRef = useRef<string[]>([]);
+  const playingRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   const splitAtNaturalBreaks = useCallback(
     (text: string, maxLen: number): string[] => {
@@ -47,53 +58,103 @@ export function useTTS() {
     []
   );
 
-  const playNext = useCallback(() => {
-    if (queueRef.current.length === 0) {
-      speakingRef.current = false;
-      return;
-    }
+  /** Browser SpeechSynthesis path */
+  const speakBrowser = useCallback(
+    (chunks: string[]) => {
+      const utterances = chunks.map((chunk) => {
+        const u = new SpeechSynthesisUtterance(chunk);
+        u.lang = 'zh-CN';
+        u.rate = 1.1;
+        u.volume = 0.8;
+        return u;
+      });
 
-    speakingRef.current = true;
-    const utterance = queueRef.current.shift()!;
+      let idx = 0;
+      const playNext = () => {
+        if (idx >= utterances.length) {
+          playingRef.current = false;
+          return;
+        }
+        const u = utterances[idx++];
+        u.onend = () => playNext();
+        u.onerror = () => playNext();
+        window.speechSynthesis.speak(u);
+      };
 
-    utterance.onend = () => playNext();
-    utterance.onerror = () => playNext();
+      playingRef.current = true;
+      playNext();
+    },
+    []
+  );
 
-    window.speechSynthesis.speak(utterance);
-  }, []);
+  /** Edge TTS path — fetch MP3 via API, decode with AudioContext */
+  const speakEdge = useCallback(
+    async (chunks: string[]) => {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext();
+      }
+      const ctx = audioContextRef.current;
+
+      for (const text of chunks) {
+        try {
+          const resp = await fetch(
+            `/api/tts?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(voice)}&rate=%2B10%25`
+          );
+          if (!resp.ok) {
+            speakBrowser([text]);
+            continue;
+          }
+          const arrayBuffer = await resp.arrayBuffer();
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ctx.destination);
+          source.start();
+          await new Promise<void>((resolve) => {
+            source.onended = () => resolve();
+          });
+        } catch {
+          speakBrowser([text]);
+        }
+      }
+      playingRef.current = false;
+    },
+    [voice, speakBrowser]
+  );
 
   const speak = useCallback(
     (text: string) => {
-      if (!window.speechSynthesis) return;
-
       const chunks = splitAtNaturalBreaks(text, MAX_CHUNK);
 
-      // 追进度: 队列积压超过 MAX_QUEUE → 清空播最新
       if (queueRef.current.length > MAX_QUEUE) {
-        window.speechSynthesis.cancel();
+        if (provider === 'browser') {
+          window.speechSynthesis.cancel();
+        }
         queueRef.current = [];
       }
 
-      for (const chunk of chunks) {
-        const utterance = new SpeechSynthesisUtterance(chunk);
-        utterance.lang = 'zh-CN';
-        utterance.rate = 1.1;
-        utterance.volume = 0.8;
-        queueRef.current.push(utterance);
-      }
+      queueRef.current.push(...chunks);
 
-      if (!speakingRef.current) {
-        playNext();
+      if (!playingRef.current) {
+        const toPlay = [...queueRef.current];
+        queueRef.current = [];
+        if (provider === 'edge') {
+          speakEdge(toPlay);
+        } else {
+          speakBrowser(toPlay);
+        }
       }
     },
-    [splitAtNaturalBreaks, playNext]
+    [splitAtNaturalBreaks, speakBrowser, speakEdge, provider]
   );
 
   const stop = useCallback(() => {
-    window.speechSynthesis?.cancel();
+    if (provider === 'browser') {
+      window.speechSynthesis?.cancel();
+    }
     queueRef.current = [];
-    speakingRef.current = false;
-  }, []);
+    playingRef.current = false;
+  }, [provider]);
 
   return { speak, stop };
 }

@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
@@ -26,6 +27,7 @@ from asr.deepgram_provider import DeepgramProvider
 from translator.types import TranslationConfig, TranslationContext
 from translator.deepseek_provider import DeepSeekProvider
 from correction.engine import CorrectionEngine
+from session.context_window import ContextWindow
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,27 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "version": "0.4.0"}
+
+
+# ─── TTS API ────────────────────────────────────────────────────
+
+@app.get("/api/tts")
+async def tts_synthesize(
+    text: str = Query(..., min_length=1, max_length=300),
+    voice: str = Query(default="zh-CN-XiaoxiaoNeural"),
+    rate: str = Query(default="+10%"),
+):
+    """流式 TTS 合成端点。返回 audio/mpeg 流。"""
+    try:
+        from tts.edge_provider import stream_synthesize
+    except ImportError:
+        raise HTTPException(status_code=503, detail="TTS service unavailable")
+
+    return StreamingResponse(
+        stream_synthesize(text, voice, rate),
+        media_type="audio/mpeg",
+        headers={"X-TTS-Provider": "edge"},
+    )
 
 
 # ─── Glossary API ───────────────────────────────────────────────
@@ -137,7 +160,9 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     segment_counter = 0
-    correction_engine = CorrectionEngine() if settings.CORRECTION_ENABLED else None
+    # Shared session context for term learning
+    session_ctx = ContextWindow()
+    correction_engine = CorrectionEngine(context=session_ctx) if settings.CORRECTION_ENABLED else None
     asr_active = bool(settings.DEEPGRAM_API_KEY)
     translation_active = bool(settings.DEEPSEEK_API_KEY)
 
@@ -225,7 +250,7 @@ async def websocket_endpoint(ws: WebSocket):
                 try:
                     last_sent = ""
                     async for trans_result in provider.stream_translate(
-                        text, context, trans_config
+                        text, context, trans_config, session_glossary=session_ctx
                     ):
                         if trans_result.finish_reason == "wait":
                             break

@@ -7,6 +7,8 @@ export interface AppSettings {
   ttsVolume: number;
   ttsEnabled: boolean;
   correctionEnabled: boolean;
+  ttsProvider: 'browser' | 'edge';
+  ttsVoice: string;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -16,6 +18,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   ttsVolume: 0.8,
   ttsEnabled: true,
   correctionEnabled: true,
+  ttsProvider: 'browser',
+  ttsVoice: 'zh-CN-XiaoxiaoNeural',
 };
 
 function loadSettings(): AppSettings {
