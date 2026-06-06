@@ -1,4 +1,4 @@
-"""翻译 Prompt 模板 — 结构感知翻译。"""
+"""翻译 Prompt 模板 — 结构感知翻译 + 术语表注入。"""
 
 SYSTEM_PROMPT = """You are a professional English-to-Chinese simultaneous interpreter.
 
@@ -23,3 +23,27 @@ TRANSLATION_WITH_CONTEXT_TEMPLATE = """Previous sentences:
 
 Translate to Chinese (consider the context above):
 {text}"""
+
+GLOSSARY_USER_TEMPLATE = """{glossary_context}
+
+Translate to Chinese (use the reference terms above if applicable; reply <<WAIT>> if the input is too fragmentary to translate):
+
+{text}"""
+
+
+def build_user_message(text: str, glossary_context: str = "") -> str:
+    """构建翻译请求的 user message。
+
+    Args:
+        text: 待翻译的英文文本
+        glossary_context: 从 RAG 检索到的术语表注入文本（可为空）
+
+    Returns:
+        完整的 user message 字符串
+    """
+    if glossary_context:
+        return GLOSSARY_USER_TEMPLATE.format(
+            glossary_context=glossary_context,
+            text=text,
+        )
+    return TRANSLATION_USER_TEMPLATE.format(text=text)
