@@ -52,6 +52,14 @@ export default function SettingsPanel({ settings, onUpdate, isOpen, onClose }: S
             onChange={e => onUpdate({ ttsVolume: Number(e.target.value) / 100 })} />
           <span style={{ marginLeft: 8 }}>{Math.round(settings.ttsVolume * 100)}%</span>
         </Row>
+        <Row label="TTS 引擎">
+          <select value={settings.ttsProvider}
+            onChange={e => onUpdate({ ttsProvider: e.target.value as 'browser' | 'edge' })}
+            style={{ background: '#333', color: '#fff', border: '1px solid #555', borderRadius: 4, padding: '2px 8px' }}>
+            <option value="browser">浏览器</option>
+            <option value="edge">Edge TTS</option>
+          </select>
+        </Row>
       </Section>
 
       <Section title="修正">

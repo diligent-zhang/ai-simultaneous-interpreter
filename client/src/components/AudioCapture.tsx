@@ -7,8 +7,8 @@
 
 import { useCallback, useEffect } from 'react';
 import { useAudioCapture } from '../hooks/useAudioCapture';
-import { connect, disconnect, sendAudioFrame, sendMessage, onMessage, onStatus } from '../services/websocket';
-import type { EchoMessage, SubtitleMessage, ServerMessage } from '../types/messages';
+import { connect, disconnect, sendAudioFrame, onMessage as registerMessage, onStatus } from '../services/websocket';
+import type { EchoMessage, ServerMessage } from '../types/messages';
 
 interface AudioCaptureProps {
   wsStatus: string;
@@ -48,7 +48,7 @@ export default function AudioCapture({
 
   // ─── 注册 WS 消息/状态监听 ───────────────────────
   useEffect(() => {
-    const unsubMsg = onMessage(handleServerMessage);
+    const unsubMsg = registerMessage(handleServerMessage);
     const unsubStatus = onStatus(setWsStatus);
     return () => {
       unsubMsg();
