@@ -46,6 +46,8 @@ class SubtitleMessage(BaseModel):
     source: str = "asr"  # "asr" | "translation"
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     timestamp: float = Field(default=0.0)
+    replace: bool = Field(default=False, description="前端是否替换同 segment_id 旧条目")
+    sequence: int = Field(default=0, description="同 segment 内递增序号")
 
 
 class StatusMessage(BaseModel):

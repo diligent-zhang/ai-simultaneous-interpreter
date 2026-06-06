@@ -26,6 +26,8 @@ export interface SubtitleMessage {
   source: 'asr' | 'translation';
   confidence: number;
   timestamp: number;
+  replace: boolean;
+  sequence: number;
 }
 
 export interface StatusMessage {
@@ -71,4 +73,6 @@ export interface SubtitleEntry {
   timestamp: number;
   source: 'asr' | 'translation';
   isFinal: boolean;
+  replace: boolean;
+  sequence: number;
 }
