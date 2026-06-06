@@ -18,3 +18,18 @@
 .app.cinema-mode .subtitle-entry {
   background: transparent !important;
 }
+
+.captured-video {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  object-fit: contain;
+  z-index: -1;
+  background: #000;
+}
+
+.app.cinema-mode .captured-video {
+  object-fit: cover;
+}

@@ -23,6 +23,7 @@ function App() {
   const [asrProvider, setAsrProvider] = useState('Deepgram');
   const [transProvider, setTransProvider] = useState('DeepSeek');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [capturedStream, setCapturedStream] = useState<MediaStream | null>(null);
   const { settings, update } = useSettings();
   const { speak } = useTTS({
     provider: settings.ttsProvider,
@@ -87,11 +88,22 @@ function App() {
         isCapturing={isCapturing}
         setIsCapturing={setIsCapturing}
         onMessage={() => {}}
+        onStreamChange={setCapturedStream}
         asrProvider={asrProvider}
         transProvider={transProvider}
         latencyMs={latencyMs}
         onSettingsClick={() => setSettingsOpen(true)}
       />
+      {/* 捕获的画面 */}
+      {capturedStream && (
+        <video
+          ref={(el) => { if (el) el.srcObject = capturedStream; }}
+          autoPlay
+          muted
+          className="captured-video"
+        />
+      )}
+
       <SubtitleOverlay
         subtitles={subtitles}
         cinemaMode={settings.cinemaMode}
