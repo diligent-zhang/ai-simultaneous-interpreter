@@ -46,5 +46,9 @@ class Settings:
     CORRECTION_ENABLED: bool = os.getenv("CORRECTION_ENABLED", "true").lower() == "true"
     MAX_CORRECTION_CALLS: int = int(os.getenv("MAX_CORRECTION_CALLS", "20"))
 
+    # RAG 知识库
+    RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "true").lower() == "true"
+    RAG_DATA_DIR: str = os.getenv("RAG_DATA_DIR", "server/data/chroma")
+
 
 settings = Settings()
