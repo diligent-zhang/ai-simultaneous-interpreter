@@ -1,15 +1,15 @@
 /**
  * useTTS — 双路径 TTS 朗读 Hook。
  *
- * Browser 模式: SpeechSynthesis API（现有逻辑）
- * Edge 模式: fetch /api/tts → AudioContext 解码播放
+ * Browser 模式: SpeechSynthesis API
+ * Edge 模式: fetch /api/tts → AudioContext 解码播放（双缓冲预取管线）
  *
- * 两种模式共用智能分块 + 队列追进度机制。
+ * 支持激进流式朗读：partial 翻译立即朗读，增量追加。
  */
 import { useRef, useCallback } from 'react';
 
 const MAX_CHUNK = 150;
-const MAX_QUEUE = 3;
+const MAX_QUEUE = 5;
 
 interface TTSOptions {
   provider: 'browser' | 'edge';
@@ -23,6 +23,8 @@ export function useTTS(options?: TTSOptions) {
   const queueRef = useRef<string[]>([]);
   const playingRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
+  // 跟踪每个 segment 已朗读到的位置（用于增量朗读）
+  const segmentSpokenLenRef = useRef<Map<string, number>>(new Map());
 
   const splitAtNaturalBreaks = useCallback(
     (text: string, maxLen: number): string[] => {
@@ -87,7 +89,7 @@ export function useTTS(options?: TTSOptions) {
     []
   );
 
-  /** Edge TTS path — fetch MP3 via API, decode with AudioContext */
+  /** Edge TTS path — 双缓冲预取管线，消除 chunk 间间隙 */
   const speakEdge = useCallback(
     async (chunks: string[]) => {
       if (!audioContextRef.current) {
@@ -95,42 +97,81 @@ export function useTTS(options?: TTSOptions) {
       }
       const ctx = audioContextRef.current;
 
-      for (const text of chunks) {
-        try {
-          const resp = await fetch(
-            `/api/tts?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(voice)}&rate=%2B10%25`
-          );
-          if (!resp.ok) {
-            speakBrowser([text]);
-            continue;
-          }
-          const arrayBuffer = await resp.arrayBuffer();
-          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-          const source = ctx.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(ctx.destination);
-          source.start();
-          await new Promise<void>((resolve) => {
-            source.onended = () => resolve();
-          });
-        } catch {
-          speakBrowser([text]);
+      if (chunks.length === 0) return;
+
+      // 预取第一个 chunk
+      let prefetchPromise: Promise<AudioBuffer | null> | null = fetchAndDecode(
+        chunks[0], voice, ctx
+      );
+
+      for (let i = 0; i < chunks.length; i++) {
+        // 等待当前 chunk 解码完成
+        const audioBuffer = await prefetchPromise;
+        // 立即启动下一个 chunk 的预取（管线化）
+        prefetchPromise = i + 1 < chunks.length
+          ? fetchAndDecode(chunks[i + 1], voice, ctx)
+          : null;
+
+        if (!audioBuffer) {
+          // Edge TTS 失败 → fallback 到 Browser TTS
+          speakBrowser(chunks.slice(i));
+          return;
         }
+
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.start();
+        await new Promise<void>((resolve) => {
+          source.onended = () => resolve();
+        });
       }
       playingRef.current = false;
     },
     [voice, speakBrowser]
   );
 
+  /** 从 Edge TTS API 获取并解码音频 */
+  const fetchAndDecode = async (
+    text: string, voiceName: string, ctx: AudioContext
+  ): Promise<AudioBuffer | null> => {
+    try {
+      const resp = await fetch(
+        `/api/tts?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(voiceName)}&rate=%2B10%25`
+      );
+      if (!resp.ok) return null;
+      const arrayBuffer = await resp.arrayBuffer();
+      return await ctx.decodeAudioData(arrayBuffer);
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * 朗读文本。如果提供了 segmentId，支持增量朗读：
+   * 只朗读上次朗读位置之后的新增部分。
+   */
   const speak = useCallback(
-    (text: string) => {
+    (text: string, segmentId?: string) => {
+      // 增量朗读：只读新增部分
+      if (segmentId) {
+        const spokenLen = segmentSpokenLenRef.current.get(segmentId) ?? 0;
+        if (text.length <= spokenLen) return;  // 没有新内容
+        const newPart = text.slice(spokenLen);
+        segmentSpokenLenRef.current.set(segmentId, text.length);
+        // 只有新增部分足够长才朗读（≥5 字）
+        if (newPart.length < 5) return;
+        text = newPart;
+      }
+
       const chunks = splitAtNaturalBreaks(text, MAX_CHUNK);
 
+      // 队列溢出：保留最后 MAX_QUEUE 个 chunk
       if (queueRef.current.length > MAX_QUEUE) {
         if (provider === 'browser') {
           window.speechSynthesis.cancel();
         }
-        queueRef.current = [];
+        queueRef.current = queueRef.current.slice(-MAX_QUEUE);
       }
 
       queueRef.current.push(...chunks);
@@ -148,13 +189,19 @@ export function useTTS(options?: TTSOptions) {
     [splitAtNaturalBreaks, speakBrowser, speakEdge, provider]
   );
 
+  /** 清除指定 segment 的朗读记录（修正时用） */
+  const clearSegment = useCallback((segmentId: string) => {
+    segmentSpokenLenRef.current.delete(segmentId);
+  }, []);
+
   const stop = useCallback(() => {
     if (provider === 'browser') {
       window.speechSynthesis?.cancel();
     }
     queueRef.current = [];
     playingRef.current = false;
+    segmentSpokenLenRef.current.clear();
   }, [provider]);
 
-  return { speak, stop };
+  return { speak, stop, clearSegment };
 }
