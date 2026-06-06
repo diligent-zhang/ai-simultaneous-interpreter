@@ -1,15 +1,15 @@
 """AI 同声传译助手 — 后端入口。
 
-Slice 3: DeepSeek 流式翻译集成。
-接收音频帧 → Deepgram ASR → InterimFilter → DeepSeek 翻译 → 双语字幕。
+接收音频帧 → Deepgram ASR → InterimFilter → RAG术语检索 → DeepSeek 翻译 → 双语字幕。
 """
 
 import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
@@ -29,10 +29,24 @@ from correction.engine import CorrectionEngine
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时初始化 RAG，关闭时清理。"""
+    if settings.RAG_ENABLED:
+        try:
+            from rag import init_rag
+            await init_rag()
+        except Exception as e:
+            logger.warning("RAG init failed, continuing without RAG: %s", e)
+    yield
+
+
 app = FastAPI(
     title="AI Simultaneous Interpreter",
-    version="0.3.0",
+    version="0.4.0",
     description="AI 同声传译助手后端服务",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -46,8 +60,60 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
+
+# ─── Glossary API ───────────────────────────────────────────────
+
+@app.get("/api/glossary/stats")
+async def glossary_stats():
+    """获取术语库统计信息。"""
+    try:
+        from rag.store import get_stats
+        return get_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/glossary/search")
+async def glossary_search(
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(default=10, ge=1, le=50),
+):
+    """搜索术语。"""
+    try:
+        from rag.store import search_terms
+        results = search_terms(q, top_k)
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/glossary/upload")
+async def glossary_upload(data: dict):
+    """上传自定义术语。
+
+    Request body:
+        {"terms": [{"en": "quantization", "zh": "量化", "domain": "AI"}, ...]}
+    """
+    terms = data.get("terms", [])
+    if not terms:
+        raise HTTPException(status_code=400, detail="No terms provided")
+
+    try:
+        from rag.store import add_custom_terms, get_stats
+        imported = add_custom_terms(terms)
+        stats = get_stats()
+        return {
+            "status": "ok",
+            "imported": imported,
+            "total": stats.get("total_terms", 0),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── WebSocket ──────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -71,10 +137,18 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     segment_counter = 0
-    # 修正引擎 Sidecar
     correction_engine = CorrectionEngine() if settings.CORRECTION_ENABLED else None
     asr_active = bool(settings.DEEPGRAM_API_KEY)
     translation_active = bool(settings.DEEPSEEK_API_KEY)
+
+    # Get RAG retriever if available
+    retriever = None
+    if settings.RAG_ENABLED:
+        try:
+            from rag import get_retriever
+            retriever = get_retriever()
+        except Exception:
+            pass
 
     async def run_asr():
         nonlocal segment_counter
@@ -105,7 +179,6 @@ async def websocket_endpoint(ws: WebSocket):
                 segment_counter += 1
                 seg_id = f"seg_{segment_counter:04d}"
 
-                # 1. Push ASR English text to frontend
                 asr_msg = SubtitleMessage(
                     segment_id=seg_id,
                     text=result.text,
@@ -116,7 +189,6 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 await ws.send_json(asr_msg.model_dump())
 
-                # 2. Filter → enqueue for translation
                 if translation_active and interim_filter.should_send_to_translation(
                     result.text, result.is_final
                 ):
@@ -140,6 +212,7 @@ async def websocket_endpoint(ws: WebSocket):
             provider = DeepSeekProvider(
                 api_key=settings.DEEPSEEK_API_KEY,
                 base_url=settings.DEEPSEEK_BASE_URL,
+                retriever=retriever,
             )
             context = TranslationContext()
 
@@ -176,7 +249,6 @@ async def websocket_endpoint(ws: WebSocket):
                         if len(context.recent_sentences) > 3:
                             context.recent_sentences.pop(0)
 
-                        # Sidecar: 修正引擎
                         if correction_engine:
                             try:
                                 seg_id = f"seg_{segment_counter:04d}"
