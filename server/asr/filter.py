@@ -84,7 +84,7 @@ class InterimFilter:
             # 冠词/代词 + 名词 + 动词
             r'\b(the|a|an|this|that|our|my|your|his|her|its)\s+\w{2,}\s+\w+(s|ed|ing)?\b',
             # 名词 + is/are/was/were + ...
-            r'\b\w{3,}\s+(is|are|was|were|has|have|will|can|could|would|should)\b',
+            r'\b\w{2,}\s+(is|are|was|were|has|have|will|can|could|would|should)\b',
             # 从句引导词 (that/which/who/when/if/because) → 复合句片段
             r'\b(that|which|who|when|if|because|although|while|since)\s+\w{3,}\s+\w+',
             # 动词短语: "talking about", "working on", "looking at"
