@@ -1,7 +1,21 @@
 """层级化上下文窗口 (设计文档 4.4 节)。"""
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+
+# 术语提取模式：英文大写词、小写复合词
+_TERM_PATTERNS = [
+    re.compile(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3})\b'),
+    re.compile(r'\b([a-z]{3,}(?:\s+[a-z]{3,}){0,2})\b'),
+]
+
+# 太常见不应收录为术语的词
+_STOP_TERMS = {
+    "the", "and", "for", "that", "this", "with", "from", "have",
+    "they", "their", "them", "about", "which", "would", "could",
+    "should", "there", "where", "also", "just", "like",
+}
 
 
 @dataclass
@@ -39,6 +53,35 @@ class ContextWindow:
             self.glossary[en_term] = zh_term
             if len(self.glossary) > self._max_glossary:
                 self.glossary.popitem(last=False)
+
+    def extract_terms(self, original: str, translation: str) -> int:
+        """从原文+译文中提取术语对照，写入 session glossary。
+
+        Returns:
+            新增术语数量
+        """
+        added = 0
+        for pattern in _TERM_PATTERNS:
+            for match in pattern.finditer(original):
+                en = match.group(1).strip().lower()
+                if len(en) < 3 or en in _STOP_TERMS:
+                    continue
+                self.add_term(en, translation)
+                added += 1
+        return added
+
+    def search_glossary(self, query: str) -> list[dict]:
+        """在 session glossary 中搜索匹配的术语。
+
+        Returns:
+            [{"en": "transformer", "zh": "Transformer 模型", "source": "session"}, ...]
+        """
+        results = []
+        query_lower = query.lower()
+        for en, zh in self.glossary.items():
+            if en in query_lower or query_lower in en:
+                results.append({"en": en, "zh": zh, "source": "session"})
+        return results[:5]
 
     def get_context_for_prompt(self) -> str:
         """组装上下文，用于 LLM 重译 prompt。"""

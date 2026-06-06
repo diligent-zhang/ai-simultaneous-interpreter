@@ -23,8 +23,11 @@ function App() {
   const [asrProvider, setAsrProvider] = useState('Deepgram');
   const [transProvider, setTransProvider] = useState('DeepSeek');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const { speak } = useTTS();
   const { settings, update } = useSettings();
+  const { speak } = useTTS({
+    provider: settings.ttsProvider,
+    voice: settings.ttsVoice,
+  });
 
   // 连接预热：页面加载即建立 WS
   useEffect(() => {
