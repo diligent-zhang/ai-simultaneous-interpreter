@@ -22,14 +22,20 @@ class DeepSeekProvider(TranslationProvider):
         self._retriever = retriever
 
     async def stream_translate(
-        self, text: str, context: TranslationContext, config: TranslationConfig
+        self,
+        text: str,
+        context: TranslationContext,
+        config: TranslationConfig,
+        session_glossary=None,
     ) -> AsyncIterator[TranslationResult]:
-        # Pre-translation: retrieve glossary terms from RAG
+        # Pre-translation: retrieve glossary terms from RAG + session
         glossary = ""
         if self._retriever:
             try:
                 from .tools import enrich_context
-                glossary = await enrich_context(text, self._retriever)
+                glossary = await enrich_context(
+                    text, self._retriever, session_glossary
+                )
             except Exception:
                 logger.debug("Glossary enrichment failed, translating without RAG")
 

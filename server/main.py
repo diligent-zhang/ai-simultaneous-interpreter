@@ -27,6 +27,7 @@ from asr.deepgram_provider import DeepgramProvider
 from translator.types import TranslationConfig, TranslationContext
 from translator.deepseek_provider import DeepSeekProvider
 from correction.engine import CorrectionEngine
+from session.context_window import ContextWindow
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,9 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     segment_counter = 0
-    correction_engine = CorrectionEngine() if settings.CORRECTION_ENABLED else None
+    # Shared session context for term learning
+    session_ctx = ContextWindow()
+    correction_engine = CorrectionEngine(context=session_ctx) if settings.CORRECTION_ENABLED else None
     asr_active = bool(settings.DEEPGRAM_API_KEY)
     translation_active = bool(settings.DEEPSEEK_API_KEY)
 
@@ -247,7 +250,7 @@ async def websocket_endpoint(ws: WebSocket):
                 try:
                     last_sent = ""
                     async for trans_result in provider.stream_translate(
-                        text, context, trans_config
+                        text, context, trans_config, session_glossary=session_ctx
                     ):
                         if trans_result.finish_reason == "wait":
                             break
