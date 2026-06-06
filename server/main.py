@@ -232,6 +232,8 @@ async def websocket_endpoint(ws: WebSocket):
                         source="asr",
                         confidence=result.confidence,
                         timestamp=time.time(),
+                        replace=not result.is_final,  # interim → 前端替换同行
+                        sequence=segment_counter,
                     )
                     await ws.send_json(asr_msg.model_dump())
 
@@ -267,6 +269,7 @@ async def websocket_endpoint(ws: WebSocket):
                 retriever=retriever,
             )
             context = TranslationContext()
+            trans_seq = 0  # 独立递增翻译计数器
 
             while True:
                 item = await translation_queue.get()
@@ -275,24 +278,30 @@ async def websocket_endpoint(ws: WebSocket):
 
                 text, is_final = item
                 try:
-                    last_sent = ""
+                    trans_seq += 1
+                    # 固定 segment_id：同一次翻译请求的 partial/final 共用
+                    trans_seg_id = f"trans_{trans_seq:04d}"
+                    partial_seq = 0
+
                     async for trans_result in provider.stream_translate(
                         text, context, trans_config, session_glossary=session_ctx
                     ):
                         if trans_result.finish_reason == "wait":
                             break
-                        if trans_result.text == last_sent and trans_result.is_partial:
-                            continue
-                        last_sent = trans_result.text
+
+                        partial_seq += 1
 
                         if trans_result.text:
+                            is_partial = trans_result.is_partial
                             trans_msg = SubtitleMessage(
-                                segment_id=f"trans_{segment_counter:04d}",
+                                segment_id=trans_seg_id,
                                 text=trans_result.text,
-                                is_final=not trans_result.is_partial,
+                                is_final=not is_partial,
                                 source="translation",
                                 confidence=0.9,
                                 timestamp=time.time(),
+                                replace=is_partial,      # partial → 前端替换同行
+                                sequence=partial_seq,
                             )
                             await ws.send_json(trans_msg.model_dump())
 
@@ -303,9 +312,8 @@ async def websocket_endpoint(ws: WebSocket):
 
                         if correction_engine:
                             try:
-                                seg_id = f"seg_{segment_counter:04d}"
                                 corr_events = correction_engine.process_translation(
-                                    seg_id, text, trans_result.text
+                                    trans_seg_id, text, trans_result.text
                                 )
                                 for event in corr_events:
                                     await ws.send_json({
