@@ -40,7 +40,7 @@ class DeepgramProvider(ASRProvider):
 
         # ── 初始化 Deepgram 客户端 ──────────────────────────
         deepgram = DeepgramClient(self._api_key)
-        dg_ws = deepgram.listen.websocket()
+        dg_ws = deepgram.listen.websocket.v("1")
         self._dg_ws = dg_ws
 
         # ── 回调定义 (Deepgram SDK v3 的回调签名不含 self) ──
