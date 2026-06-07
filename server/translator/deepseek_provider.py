@@ -57,17 +57,28 @@ class DeepSeekProvider(TranslationProvider):
             )
 
             accumulated = ""
+            last_yielded = ""  # Track last yielded text for throttling
             async for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     accumulated += delta.content
+
+                    # 节流：中文增量 < 2 字 → 跳过（消除逐字抖动）
+                    # 英文增量 < 4 chars → 跳过
+                    increment = len(accumulated) - len(last_yielded)
+                    has_chinese = any('一' <= c <= '鿿' for c in accumulated)
+                    min_increment = 2 if has_chinese else 4
+                    if increment < min_increment:
+                        continue
+
+                    last_yielded = accumulated
                     yield TranslationResult(
                         text=accumulated,
                         is_partial=True,
                     )
 
             final_text = accumulated.strip()
-            if final_text == "<<WAIT>>" or not final_text:
+            if not final_text:
                 yield TranslationResult(text="", is_partial=False, finish_reason="wait")
             else:
                 yield TranslationResult(

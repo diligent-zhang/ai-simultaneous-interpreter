@@ -16,6 +16,7 @@ interface AudioCaptureProps {
   isCapturing: boolean;
   setIsCapturing: (capturing: boolean) => void;
   onMessage: (text: string) => void;
+  onStreamChange?: (stream: MediaStream | null) => void;
   asrProvider: string;
   transProvider: string;
   latencyMs: number;
@@ -28,6 +29,7 @@ export default function AudioCapture({
   isCapturing,
   setIsCapturing,
   onMessage,
+  onStreamChange,
   asrProvider,
   transProvider,
   latencyMs,
@@ -64,9 +66,14 @@ export default function AudioCapture({
     []
   );
 
-  const { startCapture, stopCapture, error } = useAudioCapture({
+  const { startCapture, stopCapture, error, mediaStream } = useAudioCapture({
     onAudioFrame: handleAudioFrame,
   });
+
+  // 同步流到父组件用于视频渲染
+  useEffect(() => {
+    onStreamChange?.(mediaStream);
+  }, [mediaStream, onStreamChange]);
 
   // 同步捕获状态到父组件
   useEffect(() => {
@@ -82,7 +89,8 @@ export default function AudioCapture({
   const handleStop = useCallback(() => {
     stopCapture();
     disconnect();
-  }, [stopCapture]);
+    onStreamChange?.(null);
+  }, [stopCapture, onStreamChange]);
 
   const statusColor =
     wsStatus === 'connected' ? '#4caf50' :

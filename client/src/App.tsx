@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import AudioCapture from './components/AudioCapture';
 import SubtitleOverlay from './components/SubtitleOverlay';
 import SettingsPanel from './components/SettingsPanel';
@@ -23,11 +23,15 @@ function App() {
   const [asrProvider, setAsrProvider] = useState('Deepgram');
   const [transProvider, setTransProvider] = useState('DeepSeek');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [capturedStream, setCapturedStream] = useState<MediaStream | null>(null);
   const { settings, update } = useSettings();
-  const { speak } = useTTS({
+  const { speak, stop, clearSegment } = useTTS({
     provider: settings.ttsProvider,
     voice: settings.ttsVoice,
   });
+
+  // 记录每个 translation segment 已朗读到的文本位置
+  const ttsSegmentTextRef = useRef<Map<string, string>>(new Map());
 
   // 连接预热：页面加载即建立 WS
   useEffect(() => {
@@ -39,26 +43,68 @@ function App() {
       if (msg.type === 'subtitle') {
         const sub = msg as SubtitleMessage;
         const entry: SubtitleEntry = {
-          id: sub.segment_id + '_' + Date.now(),
+          id: sub.segment_id,
           text: sub.text,
           timestamp: sub.timestamp,
           source: sub.source,
           isFinal: sub.is_final,
+          replace: sub.replace,
+          sequence: sub.sequence,
         };
+
         setSubtitles((prev) => {
+          // update-or-append: replace=true 且同 id 存在 → 替换
+          if (sub.replace && sub.source === 'translation') {
+            const exists = prev.some(
+              (s) => s.id === sub.segment_id && s.source === 'translation'
+            );
+            const next = exists
+              ? prev.map((s) =>
+                  s.id === sub.segment_id && s.source === 'translation'
+                    ? entry
+                    : s
+                )
+              : [...prev, entry];
+            return next.slice(-MAX_SUBTITLES);
+          }
+          // ASR interim → 替换同 id 旧条目
+          if (sub.replace && sub.source === 'asr') {
+            const exists = prev.some(
+              (s) => s.id === sub.segment_id && s.source === 'asr'
+            );
+            const next = exists
+              ? prev.map((s) =>
+                  s.id === sub.segment_id && s.source === 'asr' ? entry : s
+                )
+              : [...prev, entry];
+            return next.slice(-MAX_SUBTITLES);
+          }
+          // final → 追加
           const next = [...prev, entry];
           return next.slice(-MAX_SUBTITLES);
         });
 
-        if (settings.ttsEnabled && sub.source === 'translation' && sub.is_final) {
-          speak(sub.text);
+        // ─── 激进流式 TTS ─────────────────────────
+        if (settings.ttsEnabled && sub.source === 'translation') {
+          const prevText = ttsSegmentTextRef.current.get(sub.segment_id) ?? '';
+          // 只朗读新增部分
+          if (sub.text.length > prevText.length) {
+            const newPart = sub.text.slice(prevText.length);
+            if (newPart.length >= 5) {
+              speak(newPart, sub.segment_id);
+            }
+          }
+          ttsSegmentTextRef.current.set(sub.segment_id, sub.text);
         }
       } else if (msg.type === 'correction' && settings.correctionEnabled) {
         const corr = msg as CorrectionMessage;
+        // 清除该 segment 的 TTS 记录（但已读出的声音不重读）
+        clearSegment(corr.segment_id);
+        // 更新字幕文字
         setSubtitles((prev) =>
           prev.map((s) =>
-            s.id.startsWith(corr.segment_id)
-              ? { ...s, text: corr.new_text }
+            s.id === corr.segment_id
+              ? { ...s, text: corr.new_text, isFinal: true }
               : s
           )
         );
@@ -72,7 +118,7 @@ function App() {
       }
     });
     return unsub;
-  }, [speak, settings.ttsEnabled, settings.correctionEnabled]);
+  }, [speak, stop, clearSegment, settings.ttsEnabled, settings.correctionEnabled]);
 
   const maxLines = settings.cinemaMode ? 2 : settings.maxLines;
   const fontSize = settings.cinemaMode
@@ -87,11 +133,22 @@ function App() {
         isCapturing={isCapturing}
         setIsCapturing={setIsCapturing}
         onMessage={() => {}}
+        onStreamChange={setCapturedStream}
         asrProvider={asrProvider}
         transProvider={transProvider}
         latencyMs={latencyMs}
         onSettingsClick={() => setSettingsOpen(true)}
       />
+      {/* 捕获的画面 */}
+      {capturedStream && (
+        <video
+          ref={(el) => { if (el) el.srcObject = capturedStream; }}
+          autoPlay
+          muted
+          className="captured-video"
+        />
+      )}
+
       <SubtitleOverlay
         subtitles={subtitles}
         cinemaMode={settings.cinemaMode}

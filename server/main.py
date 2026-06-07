@@ -197,27 +197,56 @@ async def websocket_endpoint(ws: WebSocket):
             return
 
         try:
+            # 等待首帧音频后再启动 Deepgram，避免空连接超时
+            logger.debug("Waiting for first audio frame before Deepgram connect")
+            first_chunk = await audio_queue.get()
+            if first_chunk is None:
+                return
+
             provider = DeepgramProvider(api_key=settings.DEEPGRAM_API_KEY)
             interim_filter = InterimFilter()
 
-            async for result in provider.stream_transcribe(audio_queue, asr_config):
-                segment_counter += 1
-                seg_id = f"seg_{segment_counter:04d}"
+            # 用 asyncio.Queue 包装，把首帧放回去
+            wrapped_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+            wrapped_queue.put_nowait(first_chunk)
 
-                asr_msg = SubtitleMessage(
-                    segment_id=seg_id,
-                    text=result.text,
-                    is_final=result.is_final,
-                    source="asr",
-                    confidence=result.confidence,
-                    timestamp=time.time(),
-                )
-                await ws.send_json(asr_msg.model_dump())
+            # 后台搬运原始队列到包装队列
+            async def bridge():
+                while True:
+                    chunk = await audio_queue.get()
+                    wrapped_queue.put_nowait(chunk)
+                    if chunk is None:
+                        break
 
-                if translation_active and interim_filter.should_send_to_translation(
-                    result.text, result.is_final
-                ):
-                    translation_queue.put_nowait((result.text, result.is_final))
+            bridge_task = asyncio.create_task(bridge())
+
+            try:
+                async for result in provider.stream_transcribe(wrapped_queue, asr_config):
+                    segment_counter += 1
+                    seg_id = f"seg_{segment_counter:04d}"
+
+                    asr_msg = SubtitleMessage(
+                        segment_id=seg_id,
+                        text=result.text,
+                        is_final=result.is_final,
+                        source="asr",
+                        confidence=result.confidence,
+                        timestamp=time.time(),
+                        replace=not result.is_final,  # interim → 前端替换同行
+                        sequence=segment_counter,
+                    )
+                    await ws.send_json(asr_msg.model_dump())
+
+                    if translation_active and interim_filter.should_send_to_translation(
+                        result.text, result.is_final
+                    ):
+                        translation_queue.put_nowait((result.text, result.is_final))
+            finally:
+                bridge_task.cancel()
+                try:
+                    await bridge_task
+                except asyncio.CancelledError:
+                    pass
 
         except Exception as e:
             logger.exception("ASR pipeline error: %s", e)
@@ -240,6 +269,7 @@ async def websocket_endpoint(ws: WebSocket):
                 retriever=retriever,
             )
             context = TranslationContext()
+            trans_seq = 0  # 独立递增翻译计数器
 
             while True:
                 item = await translation_queue.get()
@@ -248,24 +278,30 @@ async def websocket_endpoint(ws: WebSocket):
 
                 text, is_final = item
                 try:
-                    last_sent = ""
+                    trans_seq += 1
+                    # 固定 segment_id：同一次翻译请求的 partial/final 共用
+                    trans_seg_id = f"trans_{trans_seq:04d}"
+                    partial_seq = 0
+
                     async for trans_result in provider.stream_translate(
                         text, context, trans_config, session_glossary=session_ctx
                     ):
                         if trans_result.finish_reason == "wait":
                             break
-                        if trans_result.text == last_sent and trans_result.is_partial:
-                            continue
-                        last_sent = trans_result.text
+
+                        partial_seq += 1
 
                         if trans_result.text:
+                            is_partial = trans_result.is_partial
                             trans_msg = SubtitleMessage(
-                                segment_id=f"trans_{segment_counter:04d}",
+                                segment_id=trans_seg_id,
                                 text=trans_result.text,
-                                is_final=not trans_result.is_partial,
+                                is_final=not is_partial,
                                 source="translation",
                                 confidence=0.9,
                                 timestamp=time.time(),
+                                replace=is_partial,      # partial → 前端替换同行
+                                sequence=partial_seq,
                             )
                             await ws.send_json(trans_msg.model_dump())
 
@@ -276,9 +312,8 @@ async def websocket_endpoint(ws: WebSocket):
 
                         if correction_engine:
                             try:
-                                seg_id = f"seg_{segment_counter:04d}"
                                 corr_events = correction_engine.process_translation(
-                                    seg_id, text, trans_result.text
+                                    trans_seg_id, text, trans_result.text
                                 )
                                 for event in corr_events:
                                     await ws.send_json({
