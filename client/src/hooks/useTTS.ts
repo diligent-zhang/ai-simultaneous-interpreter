@@ -9,7 +9,6 @@
 import { useRef, useCallback } from 'react';
 
 const MAX_CHUNK = 150;
-const MAX_QUEUE = 5;
 
 interface TTSOptions {
   provider: 'browser' | 'edge';
@@ -23,8 +22,6 @@ export function useTTS(options?: TTSOptions) {
   const queueRef = useRef<string[]>([]);
   const playingRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
-  // 跟踪每个 segment 已朗读到的位置（用于增量朗读）
-  const segmentSpokenLenRef = useRef<Map<string, number>>(new Map());
 
   const splitAtNaturalBreaks = useCallback(
     (text: string, maxLen: number): string[] => {
@@ -148,31 +145,21 @@ export function useTTS(options?: TTSOptions) {
   };
 
   /**
-   * 朗读文本。如果提供了 segmentId，支持增量朗读：
-   * 只朗读上次朗读位置之后的新增部分。
+   * 朗读文本。增量去重由调用方（App.tsx）处理。
+   * 新内容到达时中断当前朗读，确保实时性。
    */
   const speak = useCallback(
-    (text: string, segmentId?: string) => {
-      // 增量朗读：只读新增部分
-      if (segmentId) {
-        const spokenLen = segmentSpokenLenRef.current.get(segmentId) ?? 0;
-        if (text.length <= spokenLen) return;  // 没有新内容
-        const newPart = text.slice(spokenLen);
-        segmentSpokenLenRef.current.set(segmentId, text.length);
-        // 只有新增部分足够长才朗读（≥5 字）
-        if (newPart.length < 5) return;
-        text = newPart;
+    (text: string, _segmentId?: string) => {
+      if (!text || text.length === 0) return;
+
+      // 中断当前朗读，播放最新内容（实时翻译场景）
+      if (provider === 'browser') {
+        window.speechSynthesis.cancel();
       }
+      queueRef.current = [];
+      playingRef.current = false;
 
       const chunks = splitAtNaturalBreaks(text, MAX_CHUNK);
-
-      // 队列溢出：保留最后 MAX_QUEUE 个 chunk
-      if (queueRef.current.length > MAX_QUEUE) {
-        if (provider === 'browser') {
-          window.speechSynthesis.cancel();
-        }
-        queueRef.current = queueRef.current.slice(-MAX_QUEUE);
-      }
 
       queueRef.current.push(...chunks);
 
@@ -189,19 +176,13 @@ export function useTTS(options?: TTSOptions) {
     [splitAtNaturalBreaks, speakBrowser, speakEdge, provider]
   );
 
-  /** 清除指定 segment 的朗读记录（修正时用） */
-  const clearSegment = useCallback((segmentId: string) => {
-    segmentSpokenLenRef.current.delete(segmentId);
-  }, []);
-
   const stop = useCallback(() => {
     if (provider === 'browser') {
       window.speechSynthesis?.cancel();
     }
     queueRef.current = [];
     playingRef.current = false;
-    segmentSpokenLenRef.current.clear();
   }, [provider]);
 
-  return { speak, stop, clearSegment };
+  return { speak, stop };
 }

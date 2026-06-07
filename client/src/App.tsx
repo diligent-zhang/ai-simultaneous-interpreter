@@ -25,7 +25,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [capturedStream, setCapturedStream] = useState<MediaStream | null>(null);
   const { settings, update } = useSettings();
-  const { speak, stop, clearSegment } = useTTS({
+  const { speak, stop } = useTTS({
     provider: settings.ttsProvider,
     voice: settings.ttsVoice,
   });
@@ -90,8 +90,10 @@ function App() {
           // 只朗读新增部分
           if (sub.text.length > prevText.length) {
             const newPart = sub.text.slice(prevText.length);
-            if (newPart.length >= 5) {
-              speak(newPart, sub.segment_id);
+            // final 或有 2+ 字增量即朗读（中文翻译每次增量很小，降低门槛）
+            const isFinal = sub.is_final;
+            if (isFinal || newPart.length >= 2) {
+              speak(isFinal ? sub.text : newPart, sub.segment_id);
             }
           }
           ttsSegmentTextRef.current.set(sub.segment_id, sub.text);
@@ -99,7 +101,8 @@ function App() {
       } else if (msg.type === 'correction' && settings.correctionEnabled) {
         const corr = msg as CorrectionMessage;
         // 清除该 segment 的 TTS 记录（但已读出的声音不重读）
-        clearSegment(corr.segment_id);
+        // 清除该 segment 的已读记录以便修正后可重新朗读
+        ttsSegmentTextRef.current.delete(corr.segment_id);
         // 更新字幕文字
         setSubtitles((prev) =>
           prev.map((s) =>
@@ -118,7 +121,7 @@ function App() {
       }
     });
     return unsub;
-  }, [speak, stop, clearSegment, settings.ttsEnabled, settings.correctionEnabled]);
+  }, [speak, stop, settings.ttsEnabled, settings.correctionEnabled]);
 
   const maxLines = settings.cinemaMode ? 2 : settings.maxLines;
   const fontSize = settings.cinemaMode
