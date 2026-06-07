@@ -9,17 +9,27 @@ EXCLUDE_PATTERN = re.compile(r'^(um|uh|er|hmm|\.{3,}|\s*)$', re.IGNORECASE)
 
 
 class InterimFilter:
-    """ASR Interim 结果过滤器。"""
+    """ASR Interim 结果过滤器。
+
+    设计原则:
+    - 激进检测语义完整片段 → 低延迟
+    - 相似度去重 → 避免 ASR 逐词细化时重复触发翻译
+    - 静音超时强制发送 → 确保停顿后不丢句
+    """
 
     def __init__(self, min_char_delta: int = 2, min_interval_ms: int = 150,
-                 force_send_chars: int = 20, force_send_timeout_ms: int = 1500):
+                 force_send_chars: int = 20, force_send_timeout_ms: int = 1500,
+                 dedup_min_new_chars: int = 8):
         self.min_char_delta = min_char_delta
         self.min_interval_ms = min_interval_ms
         self.force_send_chars = force_send_chars
         self.force_send_timeout_ms = force_send_timeout_ms / 1000.0
+        self.dedup_min_new_chars = dedup_min_new_chars  # 新增字符少于此值 → 跳过
         self._prev_text = ""
+        self._last_sent_translation = ""  # 上次发送翻译的文本（用于去重）
         self._last_send_time = 0.0
         self._last_final_time = 0.0
+        self._final_count = 0
 
     def should_send_to_translation(self, text: str, is_final: bool) -> bool:
         """判断是否应发送给翻译引擎。"""
@@ -29,7 +39,11 @@ class InterimFilter:
             self._prev_text = text
             self._last_final_time = now
             self._last_send_time = now
-            return self._should_translate(text)
+            self._final_count += 1
+            if not self._should_translate(text):
+                return False
+            self._last_sent_translation = text
+            return True
 
         if EXCLUDE_PATTERN.match(text):
             return False
@@ -40,9 +54,24 @@ class InterimFilter:
         if (now - self._last_send_time) * 1000 < self.min_interval_ms:
             return False
 
+        if not self._should_translate(text):
+            return False
+
+        # ── 去重：避免 ASR 逐词细化时重复触发翻译 ──
+        # 如果新文本只是上次发送文本的前缀扩展（同句增长），且新增字符不够多 → 跳过
+        if self._last_sent_translation:
+            if text.startswith(self._last_sent_translation):
+                new_chars = len(text) - len(self._last_sent_translation)
+                if new_chars < self.dedup_min_new_chars:
+                    return False
+            # 如果新文本是上次发送文本的子串 → 跳过（ASR 回退修正中）
+            elif self._last_sent_translation.startswith(text):
+                return False
+
+        self._last_sent_translation = text
         self._prev_text = text
         self._last_send_time = now
-        return self._should_translate(text)
+        return True
 
     def _should_translate(self, text: str) -> bool:
         """判断当前文本是否应发送翻译。
@@ -99,5 +128,6 @@ class InterimFilter:
 
     def reset(self):
         self._prev_text = ""
+        self._last_sent_translation = ""
         self._last_send_time = 0.0
         self._last_final_time = 0.0

@@ -116,12 +116,32 @@ class DeepgramProvider(ASRProvider):
             return
 
         # ── 音频转发协程 ────────────────────────────────────
+        # 发送静音帧保持 Deepgram 连接活跃，防止超时断开
+        SILENCE_MS = 20  # 每帧 20ms
+        SILENCE_BYTES = b'\x00' * (config.sample_rate * SILENCE_MS // 1000 * 2)  # 16-bit mono
+        KEEPALIVE_INTERVAL = 5.0  # 5 秒无数据则发送静音保活
+
         async def forward_audio():
+            last_data_time = asyncio.get_event_loop().time()
             try:
                 while True:
-                    chunk = await audio_queue.get()
+                    try:
+                        chunk = await asyncio.wait_for(
+                            audio_queue.get(), timeout=KEEPALIVE_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        # 超时无数据 → 发送静音保活
+                        elapsed = asyncio.get_event_loop().time() - last_data_time
+                        if elapsed >= KEEPALIVE_INTERVAL:
+                            try:
+                                dg_ws.send(SILENCE_BYTES)
+                            except Exception:
+                                pass
+                        continue
+
                     if chunk is None:
                         break
+                    last_data_time = asyncio.get_event_loop().time()
                     dg_ws.send(chunk)
             except asyncio.CancelledError:
                 pass
