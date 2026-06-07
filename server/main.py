@@ -213,63 +213,92 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json(msg.model_dump())
             return
 
-        try:
-            # 等待首帧音频后再启动 Deepgram，避免空连接超时
-            logger.debug("Waiting for first audio frame before Deepgram connect")
-            first_chunk = await audio_queue.get()
-            if first_chunk is None:
-                return
+        interim_filter = InterimFilter()
+        reconnect_attempt = 0
+        MAX_RECONNECT = 5  # 最多重连 5 次，避免无限循环
 
-            provider = DeepgramProvider(api_key=settings.DEEPGRAM_API_KEY)
-            interim_filter = InterimFilter()
-
-            # 用 asyncio.Queue 包装，把首帧放回去
-            wrapped_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-            wrapped_queue.put_nowait(first_chunk)
-
-            # 后台搬运原始队列到包装队列
-            async def bridge():
-                while True:
-                    chunk = await audio_queue.get()
-                    wrapped_queue.put_nowait(chunk)
-                    if chunk is None:
-                        break
-
-            bridge_task = asyncio.create_task(bridge())
-
+        # ── 外层重连循环：Deepgram 断开后自动恢复 ─
+        while reconnect_attempt < MAX_RECONNECT:
             try:
-                async for result in provider.stream_transcribe(wrapped_queue, asr_config):
-                    segment_counter += 1
-                    seg_id = f"seg_{segment_counter:04d}"
+                # 首帧或重连：等待音频数据
+                if reconnect_attempt == 0:
+                    logger.debug("Waiting for first audio frame before Deepgram connect")
+                else:
+                    logger.info("ASR reconnecting (attempt %d/%d)...", reconnect_attempt + 1, MAX_RECONNECT)
+                    await _safe_send(ws, StatusMessage(
+                        asr_status="reconnecting", translation_status="connected", latency_ms=0,
+                    ).model_dump())
 
-                    asr_msg = SubtitleMessage(
-                        segment_id=seg_id,
-                        text=result.text,
-                        is_final=result.is_final,
-                        source="asr",
-                        confidence=result.confidence,
-                        timestamp=time.time(),
-                        replace=not result.is_final,  # interim → 前端替换同行
-                        sequence=segment_counter,
-                    )
-                    await ws.send_json(asr_msg.model_dump())
+                first_chunk = await audio_queue.get()
+                if first_chunk is None:
+                    return
 
-                    if translation_active and interim_filter.should_send_to_translation(
-                        result.text, result.is_final
-                    ):
-                        translation_queue.put_nowait((result.text, result.is_final))
-            finally:
-                bridge_task.cancel()
+                provider = DeepgramProvider(api_key=settings.DEEPGRAM_API_KEY)
+                interim_filter.reset()
+
+                # 用 asyncio.Queue 包装，把首帧放回去
+                wrapped_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+                wrapped_queue.put_nowait(first_chunk)
+
+                # 后台搬运原始队列到包装队列
+                async def bridge():
+                    while True:
+                        chunk = await audio_queue.get()
+                        wrapped_queue.put_nowait(chunk)
+                        if chunk is None:
+                            break
+
+                bridge_task = asyncio.create_task(bridge())
+
                 try:
-                    await bridge_task
-                except asyncio.CancelledError:
-                    pass
+                    async for result in provider.stream_transcribe(wrapped_queue, asr_config):
+                        # 连接成功，重置重连计数
+                        reconnect_attempt = 0
 
-        except Exception as e:
-            logger.exception("ASR pipeline error: %s", e)
-            await _safe_send(ws, StatusMessage(
-                asr_status="error", translation_status="idle", latency_ms=0,
-            ).model_dump())
+                        segment_counter += 1
+                        seg_id = f"seg_{segment_counter:04d}"
+
+                        asr_msg = SubtitleMessage(
+                            segment_id=seg_id,
+                            text=result.text,
+                            is_final=result.is_final,
+                            source="asr",
+                            confidence=result.confidence,
+                            timestamp=time.time(),
+                            replace=not result.is_final,
+                            sequence=segment_counter,
+                        )
+                        await _safe_send(ws, asr_msg.model_dump())
+
+                        if translation_active and interim_filter.should_send_to_translation(
+                            result.text, result.is_final
+                        ):
+                            translation_queue.put_nowait((result.text, result.is_final))
+
+                    # stream_transcribe 正常结束（Deepgram 关闭了连接）
+                    logger.warning("Deepgram connection closed, will reconnect...")
+                    reconnect_attempt += 1
+                    await asyncio.sleep(1.0)  # 短暂等待后重连
+
+                finally:
+                    bridge_task.cancel()
+                    try:
+                        await bridge_task
+                    except asyncio.CancelledError:
+                        pass
+
+            except Exception as e:
+                logger.exception("ASR pipeline error: %s (attempt %d)", e, reconnect_attempt + 1)
+                reconnect_attempt += 1
+                await _safe_send(ws, StatusMessage(
+                    asr_status="error", translation_status="idle", latency_ms=0,
+                ).model_dump())
+                await asyncio.sleep(2.0)  # 错误后等待 2 秒再重连
+
+        logger.error("ASR max reconnect attempts reached, giving up")
+        await _safe_send(ws, StatusMessage(
+            asr_status="error", translation_status="idle", latency_ms=0,
+        ).model_dump())
 
     async def run_translation():
         if not translation_active:
@@ -287,6 +316,7 @@ async def websocket_endpoint(ws: WebSocket):
             )
             context = TranslationContext()
             trans_seq = 0  # 独立递增翻译计数器
+            _last_translated = ""  # 去重：上次翻译的原文
 
             while True:
                 item = await translation_queue.get()
@@ -294,6 +324,11 @@ async def websocket_endpoint(ws: WebSocket):
                     break
 
                 text, is_final = item
+
+                # ── 翻译去重：跳过与上次相同的原文 ──
+                if text == _last_translated and not is_final:
+                    continue
+                _last_translated = text
                 try:
                     trans_seq += 1
                     # 固定 segment_id：同一次翻译请求的 partial/final 共用
