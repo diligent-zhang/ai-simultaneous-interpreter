@@ -32,6 +32,23 @@ from session.context_window import ContextWindow
 logger = logging.getLogger(__name__)
 
 
+async def _safe_close(ws: WebSocket, code: int = 1000, reason: str = "") -> None:
+    """安全关闭 WebSocket，忽略已关闭的连接。"""
+    try:
+        await ws.close(code=code, reason=reason)
+    except RuntimeError:
+        pass  # 连接已关闭，无需处理
+
+
+async def _safe_send(ws: WebSocket, msg: dict) -> bool:
+    """安全发送 WebSocket 消息，连接断开时返回 False。"""
+    try:
+        await ws.send_json(msg)
+        return True
+    except RuntimeError:
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化 RAG，关闭时清理。"""
@@ -250,7 +267,7 @@ async def websocket_endpoint(ws: WebSocket):
 
         except Exception as e:
             logger.exception("ASR pipeline error: %s", e)
-            await ws.send_json(StatusMessage(
+            await _safe_send(ws, StatusMessage(
                 asr_status="error", translation_status="idle", latency_ms=0,
             ).model_dump())
 
@@ -331,9 +348,12 @@ async def websocket_endpoint(ws: WebSocket):
                     logger.error("Translation error for text '%s': %s", text[:30], e)
         except Exception as e:
             logger.exception("Translation pipeline error: %s", e)
+            await _safe_send(ws, StatusMessage(
+                asr_status="connected", translation_status="error", latency_ms=0,
+            ).model_dump())
 
     try:
-        await ws.send_json(StatusMessage(
+        await _safe_send(ws, StatusMessage(
             asr_status="connected" if asr_active else "idle",
             translation_status="connected" if translation_active else "idle",
             latency_ms=0,
@@ -363,12 +383,18 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
+    except RuntimeError as e:
+        if "disconnect" in str(e).lower():
+            logger.info("Client disconnected (RuntimeError)")
+        else:
+            logger.exception("Unexpected RuntimeError")
+            await _safe_close(ws, code=1011, reason="Internal server error")
     except (json.JSONDecodeError, ValueError) as e:
         logger.error("Invalid message: %s", e)
-        await ws.close(code=1003, reason="Invalid message format")
+        await _safe_close(ws, code=1003, reason="Invalid message format")
     except Exception:
         logger.exception("Unexpected error")
-        await ws.close(code=1011, reason="Internal server error")
+        await _safe_close(ws, code=1011, reason="Internal server error")
     finally:
         audio_queue.put_nowait(None)
         translation_queue.put_nowait(None)
