@@ -9,7 +9,7 @@
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF)](https://vite.dev/)
 
 ---
-
+视频demo项目演示   https://www.bilibili.com/video/BV1YhEb6JEpy/?vd_source=83956e5d3c7537af89915113f8216731
 ## 目录
 
 - [快速开始](#快速开始)
